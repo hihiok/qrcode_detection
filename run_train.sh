@@ -3,7 +3,12 @@ set -euo pipefail
 
 CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FSD_ROOT="${FSD_ROOT:-/mnt/ssd1/z00919662/AI-face-detect/ultraface_3323_ref_param}"
-DATA_ROOT="${DATA_ROOT:-/mnt/ssd1/z00919662/qrcode_detection/dataset}"
+DEFAULT_DATA_ROOTS="/mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_multi_240x320_rotation_validated:/mnt/ssd1/z00919662/qrcode_detection/dataset/boofcv_qr_multi_240x320_rotation_validated:/mnt/ssd1/z00919662/qrcode_detection/dataset/mendeley_qr_multi_240x320_rotation_validated"
+IFS=':' read -r -a DATA_ROOT_ARRAY <<< "${DATA_ROOTS:-${DATA_ROOT:-$DEFAULT_DATA_ROOTS}}"
+DATA_ARGS=()
+for dataset_root in "${DATA_ROOT_ARRAY[@]}"; do
+  DATA_ARGS+=(--data-root "$dataset_root")
+done
 OUTPUT_DIR="${OUTPUT_DIR:-$FSD_ROOT/models/qr_fsd_multi_yuv}"
 
 WEIGHT_ARGS=()
@@ -20,7 +25,7 @@ GPU_LIST="${CUDA_VISIBLE_DEVICES:-0}"
 mkdir -p "$OUTPUT_DIR"
 CUDA_VISIBLE_DEVICES="$GPU_LIST" python3 -u "$CODE_DIR/train_fsd_qr.py" \
   --fsd-repo "$FSD_ROOT" \
-  --data-root "$DATA_ROOT" \
+  "${DATA_ARGS[@]}" \
   --checkpoint-dir "$OUTPUT_DIR" \
   "${WEIGHT_ARGS[@]}" \
   --input-mode yuv \
