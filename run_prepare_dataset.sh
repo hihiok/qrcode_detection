@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_ROOT="${DATA_ROOT:-/data/pub1/z00919662/dataset/qr_multi_240x320}"
+DATA_ROOT="${DATA_ROOT:-/mnt/ssd1/z00919662/qrcode_detection/dataset}"
 BACKGROUND_DIR="${BACKGROUND_DIR:-/data/pub1/z00919662/dataset/coco_ADE_12cls}"
 
 python3 "$CODE_DIR/prepare_qr_dataset.py" synthetic \
@@ -16,4 +16,3 @@ python3 "$CODE_DIR/prepare_qr_dataset.py" synthetic \
   --test-count "${TEST_COUNT:-4000}"
 
 python3 "$CODE_DIR/validate_qr_dataset.py" --data-root "$DATA_ROOT" --visualize 32
-

@@ -3,11 +3,16 @@ set -euo pipefail
 
 CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FSD_ROOT="${FSD_ROOT:-/mnt/ssd1/z00919662/AI-face-detect/ultraface_3323_ref_param}"
-DATA_ROOT="${DATA_ROOT:-/data/pub1/z00919662/dataset/qr_multi_240x320}"
-OUTPUT_DIR="${OUTPUT_DIR:-$FSD_ROOT/models/qr_fsd_240x320_corners8}"
+DATA_ROOT="${DATA_ROOT:-/mnt/ssd1/z00919662/qrcode_detection/dataset}"
+OUTPUT_DIR="${OUTPUT_DIR:-$FSD_ROOT/models/qr_fsd_multi_yuv}"
 
-if [[ -z "${FD_CHECKPOINT:-}" ]]; then
-  echo "Set FD_CHECKPOINT to the existing 240-input FSD .pth checkpoint." >&2
+WEIGHT_ARGS=()
+if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+  WEIGHT_ARGS=(--resume "$RESUME_CHECKPOINT")
+elif [[ -n "${FD_CHECKPOINT:-}" ]]; then
+  WEIGHT_ARGS=(--pretrained-fd "$FD_CHECKPOINT")
+else
+  echo "Set RESUME_CHECKPOINT (old QR corners model) or FD_CHECKPOINT (bbox FSD)." >&2
   exit 2
 fi
 
@@ -17,7 +22,7 @@ CUDA_VISIBLE_DEVICES="$GPU_LIST" python3 -u "$CODE_DIR/train_fsd_qr.py" \
   --fsd-repo "$FSD_ROOT" \
   --data-root "$DATA_ROOT" \
   --checkpoint-dir "$OUTPUT_DIR" \
-  --pretrained-fd "$FD_CHECKPOINT" \
+  "${WEIGHT_ARGS[@]}" \
   --input-mode yuv \
   --input-size-key 240 \
   --batch-size "${BATCH_SIZE:-64}" \
