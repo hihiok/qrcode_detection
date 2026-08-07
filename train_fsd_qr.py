@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.optim.lr_scheduler import MultiStepLR
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, SEMANTIC_CORNER_ORDER,
                        generate_portrait_priors, load_fd_pretrained,
