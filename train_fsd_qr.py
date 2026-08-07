@@ -26,7 +26,8 @@ from qr_model import build_ordered_corner_fsd
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fsd-repo", required=True)
-    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--data-root", dest="data_roots", action="append", required=True,
+                        help="Dataset root containing train/val; repeat for multiple datasets")
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--pretrained-fd", default=None,
                         help="Original bbox(4) FSD checkpoint; its reg head is skipped")
@@ -167,12 +168,20 @@ def main():
     parameters = configure_trainable(model, args)
     if use_cuda and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
-    train_data = QRDataset(
-        os.path.join(args.data_root, "train"), priors, True,
-        args.iou_threshold, args.seed)
-    val_data = QRDataset(
-        os.path.join(args.data_root, "val"), priors, False,
-        args.iou_threshold, args.seed + 1)
+    train_sets = [
+        QRDataset(os.path.join(root, "train"), priors, True,
+                  args.iou_threshold, args.seed + index)
+        for index, root in enumerate(args.data_roots)
+    ]
+    val_sets = [
+        QRDataset(os.path.join(root, "val"), priors, False,
+                  args.iou_threshold, args.seed + 1000 + index)
+        for index, root in enumerate(args.data_roots)
+    ]
+    train_data = train_sets[0] if len(train_sets) == 1 else ConcatDataset(train_sets)
+    val_data = val_sets[0] if len(val_sets) == 1 else ConcatDataset(val_sets)
+    logging.info("dataset_roots=%s train_images=%d val_images=%d",
+                 args.data_roots, len(train_data), len(val_data))
     train_loader = DataLoader(
         train_data, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=use_cuda, drop_last=True)
