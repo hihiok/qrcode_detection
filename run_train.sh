@@ -3,7 +3,7 @@ set -euo pipefail
 
 CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FSD_ROOT="${FSD_ROOT:-/mnt/ssd1/z00919662/AI-face-detect/ultraface_3323_ref_param}"
-DATA_ROOT="${DATA_ROOT:-/data/pub1/z00919662/dataset/qr_single_240x320}"
+DATA_ROOT="${DATA_ROOT:-/data/pub1/z00919662/dataset/qr_multi_240x320}"
 OUTPUT_DIR="${OUTPUT_DIR:-$FSD_ROOT/models/qr_fsd_240x320_corners8}"
 
 if [[ -z "${FD_CHECKPOINT:-}" ]]; then
@@ -18,7 +18,7 @@ CUDA_VISIBLE_DEVICES="$GPU_LIST" python3 -u "$CODE_DIR/train_fsd_qr.py" \
   --data-root "$DATA_ROOT" \
   --checkpoint-dir "$OUTPUT_DIR" \
   --pretrained-fd "$FD_CHECKPOINT" \
-  --input-mode y \
+  --input-mode yuv \
   --input-size-key 240 \
   --batch-size "${BATCH_SIZE:-64}" \
   --num-workers "${NUM_WORKERS:-16}" \

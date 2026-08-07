@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Create a fixed 240x320 portrait, exactly-one-QR dataset.
+"""Create a fixed 240x320 portrait, zero-or-more-QR dataset.
 
 Subcommands:
-  synthetic  - generate rendered QR samples over procedural/real backgrounds
-  labelme    - convert one four-point LabelMe polygon per image
+  synthetic  - generate 0..N rendered QR instances over varied backgrounds
+  labelme    - convert every four-point QR polygon in each LabelMe image
 """
 from __future__ import print_function
 
@@ -159,10 +159,11 @@ def paste_qr(background, qr_image, quad):
     return np.clip(background * (1.0 - alpha) + warped * alpha, 0, 255).astype(np.uint8)
 
 
-def degrade(image, quad, rng):
+def degrade(image, quads, rng):
     out = image.copy()
     # Partial occlusion is kept small so all four geometric corners remain valid.
-    if rng.rand() < 0.18:
+    if quads and rng.rand() < 0.18:
+        quad = quads[int(rng.randint(0, len(quads)))]
         box = corners_to_bbox(quad)
         bw, bh = box[2] - box[0], box[3] - box[1]
         ow = max(2, int(bw * rng.uniform(0.04, 0.16)))
@@ -195,8 +196,30 @@ def degrade(image, quad, rng):
     return out
 
 
+def bbox_iou_numpy(a, b):
+    left = max(float(a[0]), float(b[0]))
+    top = max(float(a[1]), float(b[1]))
+    right = min(float(a[2]), float(b[2]))
+    bottom = min(float(a[3]), float(b[3]))
+    inter = max(0.0, right - left) * max(0.0, bottom - top)
+    area_a = max(0.0, float(a[2] - a[0])) * max(0.0, float(a[3] - a[1]))
+    area_b = max(0.0, float(b[2] - b[0])) * max(0.0, float(b[3] - b[1]))
+    return inter / max(area_a + area_b - inter, 1e-9)
+
+
+def sample_nonoverlapping_quad(rng, existing, min_side, max_side, max_iou=0.10):
+    for _ in range(200):
+        candidate = sample_quad(rng, min_side, max_side)
+        box = corners_to_bbox(candidate)
+        if all(bbox_iou_numpy(box, corners_to_bbox(other)) <= max_iou
+               for other in existing):
+            return candidate
+    raise RuntimeError("Cannot place another non-overlapping QR")
+
+
 def generate_split(root, split, count, seed, background_paths,
-                   rotate_landscape_cw, min_side, max_side):
+                   rotate_landscape_cw, min_side, max_side,
+                   max_qrs, negative_ratio):
     split_root = os.path.join(root, split)
     image_root = os.path.join(split_root, "images")
     mkdir(image_root)
@@ -204,9 +227,21 @@ def generate_split(root, split, count, seed, background_paths,
     rows = []
     for index in range(count):
         background = load_background(background_paths, rng, rotate_landscape_cw)
-        qr_image = render_qr(random_payload(rng, index), rng)
-        quad = sample_quad(rng, min_side, max_side)
-        image = degrade(paste_qr(background, qr_image, quad), quad, rng)
+        num_qrs = (0 if rng.rand() < negative_ratio else
+                   int(rng.randint(1, max_qrs + 1)))
+        quads = []
+        image = background
+        for qr_index in range(num_qrs):
+            try:
+                quad = sample_nonoverlapping_quad(
+                    rng, quads, min_side, max_side)
+            except RuntimeError:
+                break
+            qr_image = render_qr(
+                random_payload(rng, index * max_qrs + qr_index), rng)
+            image = paste_qr(image, qr_image, quad)
+            quads.append(quad)
+        image = degrade(image, quads, rng)
         name = "%s_%07d.jpg" % (split, index)
         relative = os.path.join("images", name)
         if not cv2.imwrite(os.path.join(split_root, relative), image,
@@ -216,9 +251,12 @@ def generate_split(root, split, count, seed, background_paths,
             "image": relative.replace(os.sep, "/"),
             "width": INPUT_WIDTH,
             "height": INPUT_HEIGHT,
-            "label": "qrcode",
-            "corners": [[float(x), float(y)] for x, y in quad],
-            "corner_order": list(SEMANTIC_CORNER_ORDER),
+            "instances": [
+                {"label": "qrcode",
+                 "corners": [[float(x), float(y)] for x, y in quad],
+                 "corner_order": list(SEMANTIC_CORNER_ORDER)}
+                for quad in quads
+            ],
             "synthetic": True,
         })
         if (index + 1) % 1000 == 0:
@@ -234,13 +272,16 @@ def command_synthetic(args):
     print("Background images: %d" % len(backgrounds))
     generate_split(root, "train", args.train_count, args.seed,
                    backgrounds, args.rotate_landscape_cw,
-                   args.min_qr_side, args.max_qr_side)
+                   args.min_qr_side, args.max_qr_side,
+                   args.max_qrs_per_image, args.negative_ratio)
     generate_split(root, "val", args.val_count, args.seed + 1000003,
                    backgrounds, args.rotate_landscape_cw,
-                   args.min_qr_side, args.max_qr_side)
+                   args.min_qr_side, args.max_qr_side,
+                   args.max_qrs_per_image, args.negative_ratio)
     generate_split(root, "test", args.test_count, args.seed + 2000003,
                    backgrounds, args.rotate_landscape_cw,
-                   args.min_qr_side, args.max_qr_side)
+                   args.min_qr_side, args.max_qr_side,
+                   args.max_qrs_per_image, args.negative_ratio)
 
 
 def find_labelme_image(json_path, data):
@@ -280,23 +321,36 @@ def command_labelme(args):
             data = json.load(handle)
         shapes = [s for s in data.get("shapes", [])
                   if s.get("label", "").lower() in ("qr", "qrcode", "qr_code")]
-        if len(shapes) != 1:
-            raise ValueError("%s must contain exactly one QR shape; got %d" %
-                             (json_path, len(shapes)))
-        points = validate_semantic_corners(
-            shapes[0].get("points", []), "%s LabelMe points" % json_path)
+        points = np.empty((0, 4, 2), dtype=np.float32)
+        if shapes:
+            points = np.stack([
+                validate_semantic_corners(
+                    shape.get("points", []), "%s QR shape %d" % (json_path, i))
+                for i, shape in enumerate(shapes)]).astype(np.float32)
         image = cv2.imread(find_labelme_image(json_path, data), cv2.IMREAD_COLOR)
         if image is None:
             raise IOError("Cannot read image for %s" % json_path)
         rotated = False
         if args.rotate_cw == "always" or (args.rotate_cw == "landscape" and
                                            image.shape[1] > image.shape[0]):
-            image, points = rotate_image_points_cw(image, points)
+            original_shape = points.shape
+            image, points = rotate_image_points_cw(image, points.reshape(-1, 2))
+            points = points.reshape(original_shape)
             rotated = True
-        image, points, letterbox = letterbox_image_points(image, points)
-        points = validate_semantic_corners(points, "%s transformed points" % json_path)
-        if ((points[:, 0] < 0).any() or (points[:, 0] >= INPUT_WIDTH).any() or
-                (points[:, 1] < 0).any() or (points[:, 1] >= INPUT_HEIGHT).any()):
+        original_shape = points.shape
+        image, points, letterbox = letterbox_image_points(
+            image, points.reshape(-1, 2))
+        points = points.reshape(original_shape)
+        if len(points):
+            points = np.stack([
+                validate_semantic_corners(
+                    quad, "%s transformed instance %d" % (json_path, i))
+                for i, quad in enumerate(points)])
+        if (len(points) and
+                ((points[:, :, 0] < 0).any() or
+                 (points[:, :, 0] >= INPUT_WIDTH).any() or
+                 (points[:, :, 1] < 0).any() or
+                 (points[:, :, 1] >= INPUT_HEIGHT).any())):
             raise ValueError("%s corners leave final 240x320 image" % json_path)
         split = split_from_name(os.path.relpath(json_path, args.input),
                                 args.train_ratio, args.val_ratio)
@@ -308,9 +362,12 @@ def command_labelme(args):
             "image": relative.replace(os.sep, "/"),
             "width": INPUT_WIDTH,
             "height": INPUT_HEIGHT,
-            "label": "qrcode",
-            "corners": [[float(x), float(y)] for x, y in points],
-            "corner_order": list(SEMANTIC_CORNER_ORDER),
+            "instances": [
+                {"label": "qrcode",
+                 "corners": [[float(x), float(y)] for x, y in quad],
+                 "corner_order": list(SEMANTIC_CORNER_ORDER)}
+                for quad in points
+            ],
             "synthetic": False,
             "source": os.path.relpath(json_path, args.input),
             "rotated_clockwise": rotated,
@@ -333,6 +390,8 @@ def build_parser():
     synthetic.add_argument("--seed", type=int, default=20260805)
     synthetic.add_argument("--min-qr-side", type=float, default=28.0)
     synthetic.add_argument("--max-qr-side", type=float, default=190.0)
+    synthetic.add_argument("--max-qrs-per-image", type=int, default=5)
+    synthetic.add_argument("--negative-ratio", type=float, default=0.15)
     synthetic.add_argument("--rotate-landscape-cw", action="store_true")
     synthetic.set_defaults(function=command_synthetic)
 

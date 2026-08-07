@@ -15,5 +15,6 @@ python3 "$CODE_DIR/infer_fsd_qr.py" \
   --checkpoint "$CHECKPOINT" \
   --input "$INPUT_PATH" \
   --output "${OUTPUT_PATH:-./qr_infer_output}" \
-  --input-mode y \
-  --score-threshold "${SCORE_THRESHOLD:-0.5}"
+  --input-mode yuv \
+  --score-threshold "${SCORE_THRESHOLD:-0.8}" \
+  --max-detections "${MAX_DETECTIONS:-20}"

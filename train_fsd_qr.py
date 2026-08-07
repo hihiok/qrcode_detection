@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train FSD single-branch ordered QR corners: confidence(2)+corners(8)."""
+"""Train multi-QR FSD: three-channel YUV -> confidence(2)+corners(8)."""
 from __future__ import print_function
 
 import argparse
@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, SEMANTIC_CORNER_ORDER,
                        generate_portrait_priors, load_fd_pretrained,
                        load_qr_checkpoint_strict, save_json, unpack_outputs)
-from qr_dataset import SingleQRDataset
+from qr_dataset import QRDataset
 from qr_loss import QROrderedCornerLoss
 from qr_model import build_ordered_corner_fsd
 
@@ -32,7 +32,8 @@ def parse_args():
                         help="Original bbox(4) FSD checkpoint; its reg head is skipped")
     parser.add_argument("--resume", default=None,
                         help="corners(8) QR checkpoint; loaded strictly")
-    parser.add_argument("--input-mode", choices=("y", "rgb", "yuv444"), default="y")
+    parser.add_argument("--input-mode", choices=("yuv", "yuv444"), default="yuv",
+                        help="Compatibility flag; training is always 3-channel YUV444")
     parser.add_argument("--input-size-key", type=int, default=240)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=16)
@@ -45,6 +46,7 @@ def parse_args():
     parser.add_argument("--iou-threshold", type=float, default=0.35)
     parser.add_argument("--corner-weight", type=float, default=2.0)
     parser.add_argument("--classification-weight", type=float, default=1.0)
+    parser.add_argument("--min-negatives-per-image", type=int, default=64)
     parser.add_argument("--freeze-base-net", action="store_true")
     parser.add_argument("--freeze-net", action="store_true")
     parser.add_argument("--gpus", default="0")
@@ -125,8 +127,8 @@ def run_epoch(model, loader, criterion, device, num_priors,
     return result
 
 
-def preflight(model, priors, input_mode, device):
-    channels = 1 if input_mode == "y" else 3
+def preflight(model, priors, device):
+    channels = 3
     model.eval()
     dummy = torch.zeros(1, channels, INPUT_HEIGHT, INPUT_WIDTH, device=device)
     with torch.no_grad():
@@ -161,16 +163,16 @@ def main():
         load_fd_pretrained(model, args.pretrained_fd)
     model.to(device)
     priors_device = priors.to(device)
-    preflight(model, priors_device, args.input_mode, device)
+    preflight(model, priors_device, device)
     parameters = configure_trainable(model, args)
     if use_cuda and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
-    train_data = SingleQRDataset(
+    train_data = QRDataset(
         os.path.join(args.data_root, "train"), priors, True,
-        args.input_mode, args.iou_threshold, args.seed)
-    val_data = SingleQRDataset(
+        args.iou_threshold, args.seed)
+    val_data = QRDataset(
         os.path.join(args.data_root, "val"), priors, False,
-        args.input_mode, args.iou_threshold, args.seed + 1)
+        args.iou_threshold, args.seed + 1)
     train_loader = DataLoader(
         train_data, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=use_cuda, drop_last=True)
@@ -178,7 +180,8 @@ def main():
         val_data, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=use_cuda)
     criterion = QROrderedCornerLoss(
-        3, args.corner_weight, args.classification_weight).to(device)
+        3, args.corner_weight, args.classification_weight,
+        args.min_negatives_per_image).to(device)
     optimizer = torch.optim.SGD(
         parameters, lr=args.lr, momentum=args.momentum,
         weight_decay=args.weight_decay)
@@ -191,6 +194,8 @@ def main():
         "factory": "create_Mb_Tiny_RFB_fd_3_nodilation",
         "model_outputs": {"confidence": 2, "ordered_corners": 8},
         "bbox_model_output": False,
+        "input_format": "YUV444",
+        "supports_zero_or_more_qr": True,
         "corner_order": list(SEMANTIC_CORNER_ORDER)})
     save_json(os.path.join(args.checkpoint_dir, "training_config.json"), metadata)
     best = float("inf")

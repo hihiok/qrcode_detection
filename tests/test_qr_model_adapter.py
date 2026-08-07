@@ -7,13 +7,15 @@ from torch import nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qr_model import convert_regression_head_to_ordered_corners
+from qr_model import (convert_input_to_yuv,
+                      convert_regression_head_to_ordered_corners)
 
 
 class FakeFSD(nn.Module):
     def __init__(self):
         super(FakeFSD, self).__init__()
         self.num_classes = 2
+        self.base_net = nn.Sequential(nn.Conv2d(1, 4, 3, padding=1))
         self.classification_headers = nn.ModuleList([
             nn.Conv2d(4, 3 * 2, 1), nn.Conv2d(4, 2 * 2, 1)])
         self.regression_headers = nn.ModuleList([
@@ -30,7 +32,11 @@ class FakeFSD(nn.Module):
 
 
 def test_adapter():
-    model = convert_regression_head_to_ordered_corners(FakeFSD())
+    model = convert_input_to_yuv(FakeFSD())
+    assert model.base_net[0].in_channels == 3
+    assert torch.allclose(model.base_net[0].weight[:, 1:],
+                          torch.zeros_like(model.base_net[0].weight[:, 1:]))
+    model = convert_regression_head_to_ordered_corners(model)
     confidence, corners = model([
         torch.zeros(1, 4, 3, 2), torch.zeros(1, 4, 2, 1)])
     assert confidence.shape == (1, 22, 2)

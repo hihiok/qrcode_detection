@@ -1,93 +1,63 @@
-# FSD 单二维码方向检测：仅 ordered_corners(8)
+# FSD 多二维码方向检测（YUV + ordered_corners）
 
-本实现以现有 `create_Mb_Tiny_RFB_fd_3_nodilation` 为唯一基线：
+本项目将 create_Mb_Tiny_RFB_fd_3_nodilation 改造成单阶段多二维码检测器：
 
-- 保留 backbone、RFB、extras、四层 feature map、classification head、prior 与单阶段流程；
-- 不增加 landmark head、bbox head、第二阶段或额外 backbone；
-- 将现有单一 `regression_headers` 从每个 anchor 的 `4` 个 bbox 回归量改为 `8` 个有序角点回归量；
-- 模型最终只返回 `confidence(2) + ordered_corners(8)`；
-- 匹配、NMS、可视化需要的水平 bbox 均从四角点取 min/max 临时计算，不是模型输出。
-
-输入固定为 `W×H=240×320`，Tensor 为 `N×C×320×240`。横图先顺时针旋转 90°，点坐标同步执行：
-
-```text
-x' = old_height - 1 - y
-y' = x
-```
-
-## 角点方向定义
-
-```text
-ordered_corners = [P0x,P0y,P1x,P1y,P2x,P2y,P3x,P3y]
-P0 = 二维码自身的左上角
-P1 = 二维码自身的右上角
-P2 = 二维码自身的右下角
-P3 = 二维码自身的左下角
-```
-
-`P0` 不是图像里最靠左上的点。二维码旋转 90° 后，P0 可能位于图像右上角；数据增强、旋转、
-推理和评估均保留点的身份，绝不按图像位置重新编号。真实 LabelMe polygon 必须按 P0→P1→P2→P3
-依次点击。
-
-## 为什么无需 bbox(4)
-
-GT 匹配时：
-
-```python
-derived_gt_bbox = [corners[:,0].min(), corners[:,1].min(),
-                   corners[:,0].max(), corners[:,1].max()]
-```
-
-推理 NMS 同理从预测角点派生 bbox。因此 prior 仍负责候选位置和尺度，IoU/NMS 仍可复用，但网络不再
-训练或输出单独的 bbox。
-
-## 网络输出
-
-竖图 feature map 为 `40×30、20×15、10×8、5×4`，共 `4420` 个 priors：
-
-```text
-confidence:      [N, 4420, 2]
-ordered_corners: [N, 4420, 8]
-```
-
-`qr_model.py` 先调用原工程的 `create_Mb_Tiny_RFB_fd_3_nodilation`，再把每层回归 header 的末端
-卷积从 `anchors×4` 替换为 `anchors×8`，并把原 `compute_header` 的 reshape 从 4 改成 8。
-原 FSD checkpoint 加载时，除旧 `regression_headers` 外全部严格检查和加载；8 维回归头重新初始化。
+- 输入：三通道 YUV444，N×3×320×240
+- 输出：confidence [N,4720,2] 与 ordered_corners [N,4720,8]
+- 同一张图支持 0～N 个二维码
+- 不输出独立 bbox；匹配、NMS、评估所需 bbox 均由四角点 min/max 派生
+- 每个角点保持二维码自身语义顺序 P0(TL)→P1(TR)→P2(BR)→P3(BL)
 
 ## 数据格式
 
-```text
-qr_single_240x320/
-  train/images/*.jpg
-  train/annotations.jsonl
-  val/images/*.jpg
-  val/annotations.jsonl
-  test/images/*.jpg
-  test/annotations.jsonl
-```
+~~~json
+{
+  "image": "images/000001.jpg",
+  "width": 240,
+  "height": 320,
+  "instances": [
+    {
+      "label": "qrcode",
+      "corners": [[20,30],[80,30],[80,90],[20,90]],
+      "corner_order": ["qr_top_left","qr_top_right","qr_bottom_right","qr_bottom_left"]
+    }
+  ]
+}
+~~~
 
-每行：
+负样本使用 "instances":[]。读取器也兼容旧版单二维码 corners[4,2] 和多二维码
+corners[M,4,2]。
 
-```json
-{"image":"images/train_0000000.jpg","width":240,"height":320,"label":"qrcode","corners":[[209,20],[209,200],[59,200],[59,20]],"corner_order":["qr_top_left","qr_top_right","qr_bottom_right","qr_bottom_left"]}
-```
+## 多目标训练
 
-标注不保存 bbox。代码支持单二维码合成数据，以及每图一个四点 polygon 的 LabelMe 真实数据转换。
+每个 prior 与全部 GT 的派生 bbox 计算 IoU，每个 prior 只分配给一个 GT，并强制每个 GT
+至少匹配一个唯一 prior。只有正 prior 回归其对应实例的 8 个角点；hard-negative mining
+也会从零二维码图片中选择背景 prior，能学习压制台球、球网等误检。
 
-## 快速运行
+## 从单 Y 模型迁移
 
-```bash
-python3 -m pip install -r requirements_qr.txt
-python3 tests/test_qr_geometry.py
-python3 tests/test_qr_model_adapter.py
+模型首个卷积由 1 输入通道改为 3 输入通道。加载旧单 Y checkpoint 时，原权重复制到
+Y 通道，U/V 权重置零，随后训练学习色度信息。旧的单 Y corners(8) 二维码模型可以直接
+作为 resume 权重；原人脸 bbox(4) 模型也可作为 pretrained-fd 权重。
 
-DATA_ROOT=/data/pub1/z00919662/dataset/qr_single_240x320 \
-BACKGROUND_DIR=/data/pub1/z00919662/dataset/coco_ADE_12cls \
-bash run_prepare_dataset.sh
+## 快速检查
 
-FD_CHECKPOINT=/absolute/path/to/240_input_fsd.pth bash run_train.sh
+~~~bash
+python tests/test_qr_geometry.py
+python tests/test_qr_model_adapter.py
+python tests/test_qr_dataset.py
+python -m py_compile *.py tests/*.py
+bash -n run_prepare_dataset.sh run_train.sh run_infer.sh
+~~~
 
-INPUT_PATH=/absolute/path/to/240x320/images bash run_infer.sh
-```
+## 视频推理
 
-服务器完整步骤见 `CODEAGENT_RUN_QR_FSD.md`。
+~~~bash
+python infer_video.py \
+  --fsd-repo /mnt/ssd1/z00919662/AI-face-detect/ultraface_3323_ref_param \
+  --checkpoint /path/to/qr_fsd_best.pth \
+  --input input.mp4 --output output.mp4 \
+  --score-threshold 0.8 --max-detections 20
+~~~
+
+完整服务器执行步骤见 CODEAGENT_RUN_QR_FSD.md。

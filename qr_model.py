@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapt create_Mb_Tiny_RFB_fd_3_nodilation from 4 box values to 8 corners."""
+"""Adapt the single-Y FSD to YUV input and ordered QR corners."""
 from __future__ import print_function
 
 import copy
@@ -12,6 +12,59 @@ from qr_common import NUM_CLASSES, add_repo_to_path
 
 
 _ORDERED_SUBCLASSES = {}
+
+
+def _set_child(root, path, value):
+    parent = root
+    pieces = path.split(".")
+    for piece in pieces[:-1]:
+        parent = parent[int(piece)] if piece.isdigit() else getattr(parent, piece)
+    leaf = pieces[-1]
+    if leaf.isdigit():
+        parent[int(leaf)] = value
+    else:
+        setattr(parent, leaf, value)
+
+
+def convert_input_to_yuv(model):
+    """Replace the first 1-channel Conv2d with a 3-channel YUV Conv2d.
+
+    The old kernel is copied to Y and U/V start at zero, so a single-Y
+    checkpoint has identical initial behavior before chroma fine-tuning.
+    """
+    first = None
+    search_root = getattr(model, "base_net", model)
+    prefix = "base_net." if search_root is not model else ""
+    for name, module in search_root.named_modules():
+        if name and isinstance(module, nn.Conv2d):
+            first = (prefix + name, module)
+            break
+    if first is None:
+        for name, module in model.named_modules():
+            if name and isinstance(module, nn.Conv2d):
+                first = (name, module)
+                break
+    if first is None:
+        raise RuntimeError("FSD contains no Conv2d input layer")
+    name, conv = first
+    if conv.in_channels == 3:
+        model.yuv_input = True
+        return model
+    if conv.in_channels != 1 or conv.groups != 1:
+        raise RuntimeError("Expected first Conv2d with one input channel; got %s" % conv)
+    replacement = nn.Conv2d(
+        3, conv.out_channels, conv.kernel_size, stride=conv.stride,
+        padding=conv.padding, dilation=conv.dilation, groups=1,
+        bias=conv.bias is not None, padding_mode=conv.padding_mode)
+    with torch.no_grad():
+        replacement.weight.zero_()
+        replacement.weight[:, 0:1].copy_(conv.weight)
+        if replacement.bias is not None:
+            replacement.bias.copy_(conv.bias)
+    _set_child(model, name, replacement)
+    model.yuv_input = True
+    model.yuv_input_conv_name = name
+    return model
 
 
 def _new_conv_like(conv, out_channels):
@@ -116,4 +169,5 @@ def build_ordered_corner_fsd(repo_root, num_classes=NUM_CLASSES, is_test=False,
     if "device" in signature.parameters:
         kwargs["device"] = device
     model = create_Mb_Tiny_RFB_fd_3_nodilation(num_classes, **kwargs)
+    model = convert_input_to_yuv(model)
     return convert_regression_head_to_ordered_corners(model, num_classes)

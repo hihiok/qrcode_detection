@@ -10,13 +10,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qr_common import (corners_tensor_to_boxes, decode_ordered_corners,
                        encode_ordered_corners, generate_portrait_priors,
-                       rotate_image_points_cw, validate_semantic_corners)
+                       match_qr_instances, rotate_image_points_cw,
+                       validate_semantic_corners)
 
 
 def test_portrait_priors():
     priors, feature_shapes = generate_portrait_priors()
     assert feature_shapes == [(40, 30), (20, 15), (10, 8), (5, 4)]
-    assert priors.shape == (4420, 4)
+    assert priors.shape == (4720, 4)
 
 
 def test_rotation_preserves_identity_not_image_tl():
@@ -42,8 +43,28 @@ def test_corner_codec_and_derived_bbox():
     assert torch.allclose(boxes[0], torch.tensor([0.15, 0.20, 0.75, 0.80]), atol=1e-5)
 
 
+def test_multi_instance_matching_and_negative_image():
+    priors, _ = generate_portrait_priors()
+    corners = np.float32([
+        [[0.10, 0.10], [0.30, 0.10], [0.30, 0.30], [0.10, 0.30]],
+        [[0.65, 0.60], [0.90, 0.60], [0.90, 0.85], [0.65, 0.85]]])
+    labels, targets, matched = match_qr_instances(corners, priors, 0.35)
+    assert int(labels.sum()) >= 2
+    positive_gt = set(matched[labels > 0].tolist())
+    assert positive_gt == {0, 1}
+    decoded = decode_ordered_corners(targets[labels > 0], priors[labels > 0])
+    expected = torch.from_numpy(corners)[matched[labels > 0]]
+    assert torch.allclose(decoded, expected, atol=1e-5)
+    empty_labels, empty_targets, empty_matched = match_qr_instances(
+        np.empty((0, 4, 2), np.float32), priors, 0.35)
+    assert not empty_labels.any()
+    assert not empty_targets.any()
+    assert (empty_matched == -1).all()
+
+
 if __name__ == "__main__":
     test_portrait_priors()
     test_rotation_preserves_identity_not_image_tl()
     test_corner_codec_and_derived_bbox()
+    test_multi_instance_matching_and_negative_image()
     print("PASS")
