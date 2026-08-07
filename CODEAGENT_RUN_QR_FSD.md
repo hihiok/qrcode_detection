@@ -43,13 +43,15 @@ git pull --ff-only
 ~~~bash
 export PROJECT_ROOT=/mnt/ssd1/z00919662/qrcode_detection
 export FSD_ROOT=/mnt/ssd1/z00919662/AI-face-detect/ultraface_3323_ref_param
-export DATA_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset
+export BARBER_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_multi_240x320_rotation_validated
+export BOOFCV_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/boofcv_qr_multi_240x320_rotation_validated
+export MENDELEY_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/mendeley_qr_multi_240x320_rotation_validated
 export OLD_QR_CHECKPOINT=$FSD_ROOT/models/qr_fsd_240x320_corners8/qr_fsd_best.pth
 export OUTPUT_DIR=$FSD_ROOT/models/qr_fsd_multi_yuv
 cd "$PROJECT_ROOT"
 ~~~
 
-确认 $FSD_ROOT/vision/ssd/mb_tiny_RFB_fd_3.py 存在。
+确认 $FSD_ROOT/vision/ssd/mb_tiny_RFB_fd_3.py 存在，并确认以上三个数据集目录均存在。
 
 ## 4. 静态与单元测试
 
@@ -107,6 +109,36 @@ python validate_qr_dataset.py --data-root "$DATA_ROOT" --visualize 50
 报告 train/val/test 的图片数、二维码实例数、0 二维码负样本数和每图二维码数量直方图。
 同一视频相邻帧不能跨 train/val/test。
 
+### 5.1 已准备好的真实多二维码数据集
+
+正式训练必须联合使用以下三个已经完成方向解析和旋转一致性验证的数据集：
+
+~~~text
+/mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_multi_240x320_rotation_validated
+/mnt/ssd1/z00919662/qrcode_detection/dataset/boofcv_qr_multi_240x320_rotation_validated
+/mnt/ssd1/z00919662/qrcode_detection/dataset/mendeley_qr_multi_240x320_rotation_validated
+~~~
+
+每个根目录必须包含 `train/annotations.jsonl`、`val/annotations.jsonl` 和
+`test/annotations.jsonl`，图片路径相对各自 split 目录。不要重新推断或按图像坐标重排
+P0/P1/P2/P3，也不要覆盖这三个已验证源目录。训练脚本允许重复传入
+`--data-root`，会分别加载各数据源并用 `ConcatDataset` 合并 train 和 val。
+
+正式训练前逐一执行：
+
+~~~bash
+for dataset_root in "$BARBER_ROOT" "$BOOFCV_ROOT" "$MENDELEY_ROOT"; do
+  test -f "$dataset_root/train/annotations.jsonl"
+  test -f "$dataset_root/val/annotations.jsonl"
+  test -f "$dataset_root/test/annotations.jsonl"
+  python validate_qr_dataset.py --data-root "$dataset_root" --visualize 30
+done
+~~~
+
+检查跨数据源和跨 split 的图片 SHA256；同一张图及同一视频的相邻帧不得跨
+train/val/test。报告各数据源每个 split 的图片数、二维码实例数、负样本数和
+每图实例数直方图。若某个目录结构不符合规范，先停止并在报告中说明，不得静默跳过。
+
 ## 6. 多二维码合成冒烟数据
 
 ~~~bash
@@ -149,7 +181,9 @@ CUDA_VISIBLE_DEVICES=0 python -u train_fsd_qr.py \
 mkdir -p "$OUTPUT_DIR"
 CUDA_VISIBLE_DEVICES=0,1 nohup python -u train_fsd_qr.py \
   --fsd-repo "$FSD_ROOT" \
-  --data-root "$DATA_ROOT" \
+  --data-root "$BARBER_ROOT" \
+  --data-root "$BOOFCV_ROOT" \
+  --data-root "$MENDELEY_ROOT" \
   --checkpoint-dir "$OUTPUT_DIR" \
   --resume "$OLD_QR_CHECKPOINT" \
   --input-mode yuv --input-size-key 240 \
@@ -162,14 +196,17 @@ CUDA_VISIBLE_DEVICES=0,1 nohup python -u train_fsd_qr.py \
 ## 10. 多二维码评估
 
 ~~~bash
-python eval_fsd_qr.py \
-  --fsd-repo "$FSD_ROOT" \
-  --checkpoint "$OUTPUT_DIR/qr_fsd_best.pth" \
-  --data-root "$DATA_ROOT" --split test \
-  --input-mode yuv --device cuda:0 \
-  --score-threshold 0.5 --match-iou-threshold 0.5 \
-  --max-detections 20 \
-  --output "$OUTPUT_DIR/test_metrics.json"
+for dataset_root in "$BARBER_ROOT" "$BOOFCV_ROOT" "$MENDELEY_ROOT"; do
+  dataset_name=$(basename "$dataset_root")
+  python eval_fsd_qr.py \
+    --fsd-repo "$FSD_ROOT" \
+    --checkpoint "$OUTPUT_DIR/qr_fsd_best.pth" \
+    --data-root "$dataset_root" --split test \
+    --input-mode yuv --device cuda:0 \
+    --score-threshold 0.5 --match-iou-threshold 0.5 \
+    --max-detections 20 \
+    --output "$OUTPUT_DIR/test_metrics_${dataset_name}.json"
+done
 ~~~
 
 报告 TP/FP/FN、precision、recall、F1、负样本图片误检率、bbox/polygon IoU、严格 P0
