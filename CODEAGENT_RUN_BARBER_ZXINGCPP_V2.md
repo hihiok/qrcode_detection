@@ -11,22 +11,40 @@
 
 如果存在，只终止明确属于旧 V1 的 PID。不要使用宽泛的 pkill python。
 
-## 2. 更新代码
+## 2. 下载到独立 runner，避开旧 V1 的脏工作区
 
-    cd /mnt/ssd1/z00919662/qrcode_detection
-    git status --short
-    git fetch origin agent/barber-zxingcpp-v2
-    git switch --create agent/barber-zxingcpp-v2 --track origin/agent/barber-zxingcpp-v2
+不要在原项目目录切分支。旧 CodeAgent 已在那里创建 V1 文件，直接切换可能
+与未提交内容冲突。使用独立代码目录，数据仍读取原项目的绝对路径：
 
-如果当前仓库有未提交修改，先报告 git status，不得覆盖、stash或删除用户修改。
-
+    export QR_V2_RUNNER=/mnt/ssd1/z00919662/qrcode_detection_zxingcpp_v2_runner
+    if [ ! -d "$QR_V2_RUNNER/.git" ]; then
+      if [ -e "$QR_V2_RUNNER" ]; then
+        echo "ERROR: runner path exists but is not a git repository: $QR_V2_RUNNER"
+        exit 2
+      fi
+      git clone --single-branch --branch agent/barber-zxingcpp-v2 \
+        https://github.com/hihiok/qrcode_detection.git "$QR_V2_RUNNER"
+    else
+      cd "$QR_V2_RUNNER"
+      git status --short
+      test -z "$(git status --porcelain)" || {
+        echo "ERROR: runner has local changes; do not overwrite/stash/delete them"
+        exit 2
+      }
+      git fetch origin agent/barber-zxingcpp-v2
+      git switch agent/barber-zxingcpp-v2
+      git merge --ff-only origin/agent/barber-zxingcpp-v2
+    fi
+    cd "$QR_V2_RUNNER"
     git log -1 --oneline
+
+预期最新提交为 23a7e3b，或该提交之后的同分支提交。
 
 ## 3. 使用现有 Python 3.11 环境
 
     source "$(conda info --base)/etc/profile.d/conda.sh"
     conda activate /mnt/ssd1/z00919662/qrcode_detection/.tools/zxingcpp_py311
-    cd /mnt/ssd1/z00919662/qrcode_detection
+    cd "$QR_V2_RUNNER"
     python -m pip install --no-cache-dir -r barber_label_repair_zxingcpp_v2/requirements.txt
 
 如需代理或关闭 SSL 验证，严格读取并使用：
@@ -38,9 +56,12 @@
 
 ## 4. 静态检查和单元测试
 
-    cd /mnt/ssd1/z00919662/qrcode_detection
+    cd "$QR_V2_RUNNER"
     export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-    rg -n 'placeholder|stub|dummy|result\.text|import cv2|from cv2' barber_label_repair_zxingcpp_v2
+    if rg -n 'placeholder|stub|dummy|result\.text|import cv2|from cv2' barber_label_repair_zxingcpp_v2; then
+      echo "ERROR: forbidden production pattern found"
+      exit 2
+    fi
     pytest -q barber_label_repair_zxingcpp_v2/tests
 
 预期：生产 Python 代码不含假实现、payload text访问或OpenCV；测试全部通过。
