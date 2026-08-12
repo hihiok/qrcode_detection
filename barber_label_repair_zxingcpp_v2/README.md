@@ -1,12 +1,18 @@
-# BarBeR ZXing-C++ label repair V2
+# BarBeR ZXing-C++ label repair — VGG geometry gate
 
 Audit-only recovery of QR semantic corner order for the remaining BarBeR images.
 
 Safety invariants:
 
 - V3's 799 images / 915 instances are immutable calibration gold.
-- The original BarBeR polygon is the only coordinate source.
-- ZXing coordinates are evidence only; output vertices reuse original label tokens.
+- Original BarBeR VIA/VGG polygons are rebuilt from the source images and are
+  the only automatic coordinate source.
+- Processed dataset TXT labels are immutable legacy inputs only. They are not
+  used by audit, review rendering, recovered labels, or finalization.
+- ZXing coordinates are evidence only; output vertices reuse transformed VGG
+  polygon tokens.
+- All 799 V3 gold images / 915 instances must match transformed VGG vertices
+  before the 420-image audit is allowed to start.
 - Calibration must pass before audit starts.
 - Only images whose every instance is Grade ZA enter combined_proposed.
 - No OpenCV import, no payload text access, no apply mode.
@@ -18,12 +24,14 @@ and must not be used for production.
 
 Run:
 
-    python -m barber_label_repair_zxingcpp_v2.cli all \
+    python -m barber_label_repair_zxingcpp_v2.cli doctor \
       --dataset /mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_multi_240x320_rotation_validated \
+      --barber-root /mnt/ssd1/z00919662/qrcode_detection/dataset/BarBeR \
       --v3-work /mnt/ssd1/z00919662/qrcode_detection/dataset/barber_label_repair_v3_work \
-      --work /mnt/ssd1/z00919662/qrcode_detection/dataset/barber_label_repair_zxingcpp_v2_work
+      --work /mnt/ssd1/z00919662/qrcode_detection/dataset/barber_label_repair_zxingcpp_v3_geometry_work
 
-If calibration fails, exit code is 2 and the 420-image audit is not run.
+See `CODEAGENT_RUN_BARBER_ZXINGCPP_V3_GEOMETRY.md` for the required two-step
+doctor/audit flow and safe reuse of the already-passed V2 calibration.
 
 After audit, generate the human-review pack for every remaining ZB/ZM image:
 
