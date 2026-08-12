@@ -87,7 +87,17 @@ def immutable_paths(records, v3):
 def doctor(cfg: Config, detector: ZXingSafeDetector):
     records, v3 = image_records(cfg)
     detector.negative_control()
-    write_json(cfg.work / "immutable_before.json", snapshot(immutable_paths(records, v3)))
+    baseline_path = cfg.work / "immutable_before.json"
+    current = snapshot(immutable_paths(records, v3))
+    if baseline_path.is_file():
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        if baseline != current:
+            changed = sorted(k for k in set(baseline) | set(current)
+                             if baseline.get(k) != current.get(k))
+            raise RuntimeError(
+                f"immutable inputs changed since first doctor run: {changed[:5]}")
+    else:
+        write_json(baseline_path, current)
     with (cfg.work / "failed_420_manifest.jsonl").open("w", encoding="utf-8") as f:
         for r in records:
             if (r.split, r.stem) not in v3:
