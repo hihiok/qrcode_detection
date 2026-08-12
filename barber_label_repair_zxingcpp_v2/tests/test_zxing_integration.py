@@ -1,4 +1,5 @@
 import hashlib
+import json
 
 from PIL import Image
 import zxingcpp
@@ -72,3 +73,46 @@ def test_end_to_end_single_image_audit_reuses_manual_tokens(tmp_path):
     assert report["ZA_images"] == 1
     recovered = work / "recovered_labels" / "train" / "labels" / "fixture.txt"
     assert recovered.read_text(encoding="utf-8").strip() == original_line
+
+
+def test_audit_isolates_degenerate_instance_and_removes_stale_output(tmp_path):
+    detector = ZXingSafeDetector()
+    barcode = zxingcpp.create_barcode(
+        "v2-degenerate-control", zxingcpp.BarcodeFormat.QRCode)
+    qr = Image.fromarray(barcode.to_image(scale=6, add_quiet_zones=True)).convert("RGB")
+    image = Image.new("RGB", (240, 320), "white")
+    image.paste(qr, (30, 60))
+    position = detector.read(image, "LocalAverage", False)[0].position
+    image_path = tmp_path / "train" / "images" / "mixed.png"
+    label_path = tmp_path / "train" / "labels" / "mixed.txt"
+    image_path.parent.mkdir(parents=True)
+    label_path.parent.mkdir(parents=True)
+    image.save(image_path)
+    valid = "0 " + " ".join(
+        value for x, y in position
+        for value in (f"{x / image.width:.9f}", f"{y / image.height:.9f}"))
+    degenerate = "0 1.0 0.1 1.0 0.2 1.0 0.3 1.0 0.4"
+    label_path.write_text(valid + "\n" + degenerate + "\n", encoding="utf-8")
+    record = ImageRecord("train", "mixed", image_path, label_path)
+    work = tmp_path / "work"
+    stale = work / "recovered_labels" / "train" / "labels" / "stale.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale\n", encoding="utf-8")
+    report = audit(
+        Config(tmp_path, tmp_path / "v3", work, expect_gold_instances=0,
+               allow_count_mismatch=True),
+        detector, [record], {}, (0, 1, 2, 3), False)
+    assert report["ZA_instances"] == 1
+    assert report["ZM_instances"] == 1
+    assert report["ZM_images"] == 1
+    assert report["combined_proposed_images"] == 0
+    assert report["combined_proposed_instances"] == 0
+    assert not stale.exists()
+    review = json.loads(
+        (work / "review_grade_zm" / "train" / "mixed.json").read_text())
+    assert review["instances"][1]["facts"] == {
+        "reason": "invalid_manual_quad",
+        "geometry_issue": "bbox_width_lt_4px",
+        "manual_points": [[240.0, 32.0], [240.0, 64.0],
+                          [240.0, 96.0], [240.0, 128.0]],
+    }

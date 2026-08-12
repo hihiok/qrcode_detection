@@ -4,7 +4,7 @@ from PIL import Image
 from barber_label_repair_zxingcpp_v2.detector import preprocess
 from barber_label_repair_zxingcpp_v2.geometry import (
     apply_homography, best_vertex_assignment, geometric_order,
-    rotate_image_and_h, semantic_to_manual, solve_homography,
+    quad_geometry_issue, rotate_image_and_h, semantic_to_manual, solve_homography,
 )
 
 
@@ -46,3 +46,10 @@ def test_preprocessors_no_cv2_and_shape():
     for name in ("rgb", "gray", "gamma_0.7", "gamma_1.4", "unsharp",
                  "otsu", "adaptive", "invert"):
         assert preprocess(im, name).size == im.size
+
+
+def test_degenerate_boundary_quad_is_identified():
+    boundary = np.array([[240, 10], [240, 40], [240, 80], [240, 120]], float)
+    assert quad_geometry_issue(boundary) == "bbox_width_lt_4px"
+    valid = np.array([[10, 10], [90, 10], [90, 90], [10, 90]], float)
+    assert quad_geometry_issue(valid) is None

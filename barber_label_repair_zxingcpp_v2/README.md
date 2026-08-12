@@ -25,6 +25,18 @@ Run:
 
 If calibration fails, exit code is 2 and the 420-image audit is not run.
 
+After audit, generate the human-review pack for every remaining ZB/ZM image:
+
+    python -m barber_label_repair_zxingcpp_v2.review pack \
+      --dataset /path/to/barber_qr_multi_240x320_rotation_validated \
+      --work /path/to/barber_label_repair_zxingcpp_v2_work
+
+The pack contains annotated preview pages and a pending decision JSONL. Automatic
+ZA labels are never mixed with unreviewed ZB/ZM labels. After a human fills every
+decision, `review finalize` creates a new complete 1219-image dataset; it never
+overwrites the source dataset. Degenerate polygons and parse errors require an
+explicit corrected label under `manual_corrected_labels/<split>/labels/`.
+
 The integration test creates a synthetic QR entirely in memory and sends it
 through the real zxing-cpp 3.1.1 binding. It also verifies that blank RGB input
 returns no result with and without return_errors.

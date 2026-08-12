@@ -15,7 +15,8 @@ from .data import (append_jsonl, discover_dataset, discover_v3_labels, open_rgb,
                    parse_label, snapshot, write_json)
 from .detector import ZXingSafeDetector, preprocess
 from .geometry import (View, apply_homography, best_vertex_assignment, crop_view,
-                       rotate_image_and_h, semantic_to_manual, warp_view)
+                       quad_geometry_issue, rotate_image_and_h,
+                       semantic_to_manual, warp_view)
 
 
 TRANSFORM_MISMATCH = {
@@ -52,11 +53,21 @@ class Config:
     allow_count_mismatch: bool = False
 
 
-def geometry_views(image, quad, spec) -> Iterator[View]:
+def geometry_views(image, quad, spec, errors: list[dict] | None = None) -> Iterator[View]:
     for margin in spec["crops"]:
-        yield crop_view(image, quad.points, margin)
+        try:
+            yield crop_view(image, quad.points, margin)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            if errors is not None:
+                errors.append({"geometry_id": f"crop_m{margin:.2f}_t512",
+                               "error": type(exc).__name__, "message": str(exc)})
     for size, quiet in spec["warps"]:
-        yield warp_view(image, quad.points, size, quiet)
+        try:
+            yield warp_view(image, quad.points, size, quiet)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            if errors is not None:
+                errors.append({"geometry_id": f"warp_s{size}_q{quiet:.2f}",
+                               "error": type(exc).__name__, "message": str(exc)})
 
 
 def image_records(cfg: Config):
@@ -303,25 +314,60 @@ def copy_review(cfg, rec, grade_name, report):
     write_json(target / f"{rec.stem}.json", report)
 
 
+def reset_audit_outputs(cfg: Config) -> None:
+    """Remove only outputs owned by audit so a retry cannot reuse partial results."""
+    for name in ("recovered_labels", "review_grade_zb", "review_grade_zm",
+                 "combined_proposed"):
+        path = cfg.work / name
+        if path.exists():
+            shutil.rmtree(path)
+
+
 def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
+    reset_audit_outputs(cfg)
     failed = [r for r in records if (r.split, r.stem) not in v3]
     predictions, failures, image_reports = [], [], []
-    za_i = zb_i = zm_i = za_images = 0
+    za_i = zb_i = zm_i = za_images = recovered_output_instances = 0
     with (cfg.work / "orientation_evidence.jsonl").open("w", encoding="utf-8") as ef:
         for rec in failed:
             image = open_rgb(rec.image_path)
-            quads = parse_label(rec.label_path, *image.size)
             instance_reports = []
             force_zm = rec.image_id in TRANSFORM_MISMATCH
+            try:
+                quads = parse_label(rec.label_path, *image.size)
+                parse_error = None
+            except ValueError as exc:
+                quads = []
+                parse_error = str(exc)
+                instance_reports.append({
+                    "instance_id": f"{rec.image_id}#parse_error", "grade": "ZM",
+                    "semantic_to_manual": None,
+                    "facts": {"reason": "invalid_label_file", "detail": parse_error},
+                    "_evidence_keys": set()})
             for i, quad in enumerate(quads):
                 iid = f"{rec.image_id}#{i}"
                 rows = []
-                if not force_zm:
+                issue = quad_geometry_issue(quad.points)
+                if force_zm:
+                    g, ordering, facts = "ZM", None, {"reason": "transform mismatch"}
+                elif issue is not None:
+                    g, ordering, facts = "ZM", None, {
+                        "reason": "invalid_manual_quad", "geometry_issue": issue,
+                        "manual_points": quad.points.tolist()}
+                else:
+                    view_errors: list[dict] = []
                     for tier_no, spec in enumerate(AUDIT_TIERS, 1):
-                        new_rows = list(scan_quad(
-                            detector, image, quad, geometry_views(image, quad, spec),
-                            spec["pre"], spec["bins"], allow_errors,
-                            rec.image_id, iid, field_to_semantic))
+                        try:
+                            new_rows = list(scan_quad(
+                                detector, image, quad,
+                                geometry_views(image, quad, spec, view_errors),
+                                spec["pre"], spec["bins"], allow_errors,
+                                rec.image_id, iid, field_to_semantic))
+                        except (ValueError, np.linalg.LinAlgError) as exc:
+                            view_errors.append({
+                                "geometry_id": f"tier_{tier_no}",
+                                "error": type(exc).__name__, "message": str(exc)})
+                            new_rows = []
                         for row in new_rows:
                             row["tier"] = tier_no
                             append_jsonl(ef, row)
@@ -329,8 +375,8 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
                         g, ordering, facts = grade(rows)
                         if g == "ZA": break
                     g, ordering, facts = grade(rows)
-                else:
-                    g, ordering, facts = "ZM", None, {"reason": "transform mismatch"}
+                    if view_errors:
+                        facts["skipped_geometry_views"] = view_errors
                 instance_reports.append({
                     "instance_id": iid, "grade": g,
                     "semantic_to_manual": list(ordering) if ordering else None,
@@ -361,6 +407,7 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
             image_reports.append(report)
             if image_grade == "ZA":
                 za_images += 1
+                recovered_output_instances += len(quads)
                 out = cfg.work / "recovered_labels" / rec.split / "labels" / f"{rec.stem}.txt"
                 out.parent.mkdir(parents=True, exist_ok=True)
                 lines = [q.reordered_line(tuple(x["semantic_to_manual"]))
@@ -403,11 +450,15 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
         "multi_qr_failed_images": len(multi),
         "fully_recovered": sum(r["grade"] == "ZA" for r in multi),
         "images": multi})
-    report = {"input_failed_images": len(failed), "ZA_images": za_images,
+    report = {"input_failed_images": len(failed),
+              "input_failed_instances": za_i + zb_i + zm_i,
+              "ZA_images": za_images,
               "ZA_instances": za_i, "ZB_instances": zb_i, "ZM_instances": zm_i,
               "ZB_images": sum(r["grade"] == "ZB" for r in image_reports),
               "ZM_images": sum(r["grade"] == "ZM" for r in image_reports),
-              "combined_proposed_images": len(v3) + za_images}
+              "combined_proposed_images": len(v3) + za_images,
+              "combined_proposed_instances": (cfg.expect_gold_instances +
+                                                recovered_output_instances)}
     write_json(cfg.work / "recovery_report.json", report)
     return report
 

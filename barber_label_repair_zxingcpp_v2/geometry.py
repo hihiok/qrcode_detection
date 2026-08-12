@@ -11,6 +11,29 @@ from PIL import Image
 FIELD_NAMES = ("top_left", "top_right", "bottom_right", "bottom_left")
 
 
+def quad_geometry_issue(points: np.ndarray, min_span: float = 4.0) -> str | None:
+    """Return a stable reason when a manual quad cannot define a usable 2-D ROI."""
+    p = np.asarray(points, dtype=np.float64)
+    if p.shape != (4, 2):
+        return "shape_not_4x2"
+    if not np.isfinite(p).all():
+        return "non_finite_coordinate"
+    if len(np.unique(np.round(p, 6), axis=0)) != 4:
+        return "duplicate_vertices"
+    span = p.max(axis=0) - p.min(axis=0)
+    if span[0] < min_span:
+        return "bbox_width_lt_4px"
+    if span[1] < min_span:
+        return "bbox_height_lt_4px"
+    idx = geometric_order(p)
+    q = p[idx]
+    area2 = abs(float(np.sum(q[:, 0] * np.roll(q[:, 1], -1) -
+                             np.roll(q[:, 0], -1) * q[:, 1])))
+    if area2 < 2.0:
+        return "polygon_area_lt_1px2"
+    return None
+
+
 def apply_homography(h: np.ndarray, points: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64)
     hp = np.c_[points, np.ones(len(points))] @ np.asarray(h, dtype=np.float64).T
