@@ -361,8 +361,7 @@ def resolve_record(output_path: Path, meta: dict, indices: dict,
     target = open_rgb(output_path)
     scored = []
     for record in candidates:
-        with Image.open(record["source_image"]) as handle:
-            source = handle.convert("RGB")
+        source = open_rgb(record["source_image"])
         rendered, transform = render_to_processed(source, out_width, out_height, pad_value)
         if rendered.size != target.size:
             continue

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image
+from PIL import Image, ImageOps
 import numpy as np
 
 
@@ -120,4 +120,8 @@ def append_jsonl(handle, obj: object) -> None:
 
 def open_rgb(path: Path) -> Image.Image:
     with Image.open(path) as im:
-        return im.convert("RGB")
+        # BarBeR contains JPEGs whose portrait display orientation is stored in
+        # EXIF rather than in the encoded pixel matrix.  V3 used OpenCV, which
+        # honors that orientation on read.  Apply it explicitly so the Pillow
+        # geometry path uses the same coordinate system as the VGG polygons.
+        return ImageOps.exif_transpose(im).convert("RGB")

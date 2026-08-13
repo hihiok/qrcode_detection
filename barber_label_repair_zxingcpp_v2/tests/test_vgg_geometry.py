@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from barber_label_repair_zxingcpp_v2.data import ImageRecord
 from barber_label_repair_zxingcpp_v2.vgg_geometry import (
@@ -68,3 +68,53 @@ def test_vgg_geometry_rebuild_and_gold_cross_validation(tmp_path):
         expected_gold_images=1, expected_gold_instances=1)
     assert report["passed"]
     assert report["maximum_vertex_error_px"] < 1e-4
+
+
+def test_exif_display_orientation_matches_v3_coordinate_system(tmp_path):
+    barber = tmp_path / "BarBeR"
+    source_path = barber / "set" / "exif_portrait.jpg"
+    source_path.parent.mkdir(parents=True)
+
+    # Stored pixels are landscape, but EXIF orientation 6 displays the image
+    # as 200x400 portrait.  BarBeR's VGG coordinates use that display space.
+    stored = Image.new("RGB", (400, 200), (40, 60, 80))
+    exif = Image.Exif()
+    exif[274] = 6
+    stored.save(source_path, quality=100, exif=exif)
+    with Image.open(source_path) as handle:
+        displayed = ImageOps.exif_transpose(handle).convert("RGB")
+    assert displayed.size == (200, 400)
+
+    points = np.asarray([[20, 40], [180, 40], [180, 360], [20, 360]],
+                        dtype=np.float64)
+    vgg = {"one": {"filename": source_path.name, "regions": [{
+        "shape_attributes": {
+            "name": "polygon",
+            "all_points_x": points[:, 0].tolist(),
+            "all_points_y": points[:, 1].tolist(),
+        },
+        "region_attributes": {"type": "QR"},
+    }]}}
+    (source_path.parent / "annotations.json").write_text(
+        json.dumps(vgg), encoding="utf-8")
+
+    dataset = tmp_path / "dataset"
+    image_path = dataset / "train" / "images" / "barber_exif.png"
+    label_path = dataset / "train" / "labels" / "barber_exif.txt"
+    image_path.parent.mkdir(parents=True)
+    label_path.parent.mkdir(parents=True)
+    rendered, expected_transform = render_to_processed(displayed, 240, 320, 127)
+    rendered.save(image_path)
+
+    annotations, errors = load_barber_annotations(barber)
+    assert errors == []
+    score, _, record, transform = resolve_record(
+        image_path, {"source_image": "set/exif_portrait.jpg"},
+        build_record_indices(annotations), 240, 320, 127, .90)
+    assert score > .99
+    assert transform == expected_transform
+    assert transform["source_width"] == 200
+    assert transform["source_height"] == 400
+    assert transform["rotated_landscape_cw"] is False
+    transformed = transform_points_to_processed(points, transform)
+    assert np.allclose(transformed[0], [56.0, 32.0])
