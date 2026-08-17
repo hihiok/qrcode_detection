@@ -5,10 +5,13 @@
 只保留已经确认角点语义顺序的两类数据：
 
 - V3 人工 gold：799 张、915 个实例；
-- ZXing ZA 自动通过：228 张、238 个实例。
+- ZXing 全图 ZA 自动通过：228 张、229 个实例。
 
-最终导出 1027 张图片、1153 个二维码实例。明确丢弃全部 ZB/ZM：192 张、237 个
-实例。输出必须是新的自包含数据集，包含 `images/`、`labels/`、重建后的
+最终导出 1027 张图片、1144 个二维码实例。明确按整图丢弃全部 ZB/ZM 图片：192
+张、246 个实例。被丢弃的图片中有237个ZB/ZM实例，以及与它们同图的9个ZA实例。
+Audit报告中的 `ZA_instances=238` 是实例级统计，不等于最终保留的ZA实例数：只有
+位于全图ZA图片中的229个实例被保留。输出必须是新的自包含数据集，包含
+`images/`、`labels/`、重建后的
 `annotations.jsonl`、1027 张单图预览和覆盖全部图片的分页总览。
 
 不得把原数据集旧 TXT 当作角点来源。导出标签只能来自已通过 validation 的
@@ -119,8 +122,10 @@ test ! -e "$QR_OUTPUT"
 - `vgg_gold_cross_validation_passed=true`；
 - `old_txt_geometry_used=false`；
 - `combined_proposed_images=1027`；
-- `combined_proposed_instances=1153`；
+- `combined_proposed_instances=1144`；
 - ZB+ZM 恰好192张；
+- V3 gold保留915实例、全图ZA保留229实例；
+- 整图丢弃246实例，其中237个为ZB/ZM、9个为同图ZA；
 - `recovery_failures.jsonl` 中的任何 image_id 都不能进入 accepted 集。
 
 ## 4. 导出新数据集和1027张预览
@@ -132,10 +137,15 @@ python -m barber_label_repair_zxingcpp_v2.accepted_export \
   --work "$QR_WORK" \
   --output "$QR_OUTPUT" \
   --expected-images 1027 \
-  --expected-instances 1153 \
+  --expected-instances 1144 \
   --expected-dropped-images 192 \
   --expected-v3-images 799 \
   --expected-za-images 228 \
+  --expected-gold-instances 915 \
+  --expected-accepted-za-instances 229 \
+  --expected-dropped-instances 246 \
+  --expected-dropped-non-za-instances 237 \
+  --expected-dropped-embedded-za-instances 9 \
   --page-size 20 \
   --columns 4 \
   2>&1 | tee "$QR_OUTPUT.export_console.log"
@@ -176,15 +186,18 @@ preview = json.loads((root / "preview" / "preview_report.json").read_text())
 
 assert report["passed"] is True, report
 assert report["images"] == 1027, report
-assert report["instances"] == 1153, report
+assert report["instances"] == 1144, report
 assert report["sources"] == {"V3_gold": 799, "ZXing_ZA": 228}, report
+assert report["source_instances"] == {"V3_gold": 915, "ZXing_ZA": 229}, report
 assert report["dropped_images"] == 192, report
-assert report["dropped_instances"] == 237, report
+assert report["dropped_instances"] == 246, report
+assert report["dropped_non_za_instances"] == 237, report
+assert report["dropped_embedded_za_instances"] == 9, report
 assert report["old_dataset_txt_used_as_geometry"] is False, report
 assert report["original_inputs_unchanged"] is True, report
 assert preview["passed"] is True, preview
 assert preview["images"] == 1027, preview
-assert preview["instances"] == 1153, preview
+assert preview["instances"] == 1144, preview
 assert preview["per_image_previews"] == 1027, preview
 assert preview["pages"] == 52, preview
 
@@ -215,9 +228,9 @@ git diff --exit-code
 
 - branch、精确 commit、测试数量；
 - 输出路径；
-- 1027张/1153实例；
-- V3 799张、ZA 228张；
-- 丢弃 ZB/ZM 192张、237实例；
+- 1027张/1144实例；
+- V3 799张/915实例、全图ZA 228张/229实例；
+- 丢弃 ZB/ZM 图片192张/246实例，其中237个ZB/ZM实例、9个同图ZA实例；
 - train/val/test 各自图片和实例数；
 - `annotations.jsonl`、labels、images 各1027；
 - 单图预览1027张、分页总览52页；

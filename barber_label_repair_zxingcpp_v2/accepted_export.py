@@ -60,8 +60,12 @@ def _annotate(image: Image.Image, quads, scale: int = 2) -> Image.Image:
     return canvas
 
 
-def _validate_reports(work: Path, expected_images: int,
-                      expected_instances: int, expected_dropped_images: int) -> dict:
+def _validate_reports(work: Path, expected_images: int, expected_instances: int,
+                      expected_dropped_images: int, expected_gold_instances: int,
+                      expected_accepted_za_instances: int,
+                      expected_dropped_instances: int,
+                      expected_dropped_non_za_instances: int,
+                      expected_dropped_embedded_za_instances: int) -> dict:
     recovery = json.loads((work / "recovery_report.json").read_text(encoding="utf-8"))
     validation = json.loads((work / "validation_report.json").read_text(encoding="utf-8"))
     if validation.get("passed") is not True:
@@ -79,6 +83,21 @@ def _validate_reports(work: Path, expected_images: int,
     dropped = recovery.get("ZB_images", 0) + recovery.get("ZM_images", 0)
     if dropped != expected_dropped_images:
         raise RuntimeError(f"unexpected dropped image count: {dropped}")
+    accepted_za_instances = (recovery.get("combined_proposed_instances", 0) -
+                             expected_gold_instances)
+    dropped_non_za_instances = (recovery.get("ZB_instances", 0) +
+                                recovery.get("ZM_instances", 0))
+    dropped_embedded_za_instances = (recovery.get("ZA_instances", 0) -
+                                     accepted_za_instances)
+    dropped_instances = (recovery.get("input_failed_instances", 0) -
+                         accepted_za_instances)
+    actual = (accepted_za_instances, dropped_instances, dropped_non_za_instances,
+              dropped_embedded_za_instances)
+    expected = (expected_accepted_za_instances, expected_dropped_instances,
+                expected_dropped_non_za_instances,
+                expected_dropped_embedded_za_instances)
+    if actual != expected:
+        raise RuntimeError(f"unexpected accepted/dropped instance accounting: {actual}")
     return recovery
 
 
@@ -87,9 +106,14 @@ def _source_for(record: ImageRecord, recovered: set[tuple[str, str]]) -> str:
 
 
 def export_accepted(dataset: Path, work: Path, output: Path,
-                    expected_images: int = 1027, expected_instances: int = 1153,
+                    expected_images: int = 1027, expected_instances: int = 1144,
                     expected_dropped_images: int = 192,
                     expected_v3_images: int = 799, expected_za_images: int = 228,
+                    expected_gold_instances: int = 915,
+                    expected_accepted_za_instances: int = 229,
+                    expected_dropped_instances: int = 246,
+                    expected_dropped_non_za_instances: int = 237,
+                    expected_dropped_embedded_za_instances: int = 9,
                     page_size: int = 20, columns: int = 4) -> dict:
     if output.exists():
         raise FileExistsError(f"refusing to overwrite output: {output}")
@@ -97,7 +121,10 @@ def export_accepted(dataset: Path, work: Path, output: Path,
         raise ValueError("page_size and columns must be positive")
 
     recovery = _validate_reports(
-        work, expected_images, expected_instances, expected_dropped_images)
+        work, expected_images, expected_instances, expected_dropped_images,
+        expected_gold_instances, expected_accepted_za_instances,
+        expected_dropped_instances, expected_dropped_non_za_instances,
+        expected_dropped_embedded_za_instances)
     records = {(record.split, record.stem): record
                for record in discover_dataset(dataset)}
     accepted = _accepted_labels(work)
@@ -128,6 +155,7 @@ def export_accepted(dataset: Path, work: Path, output: Path,
     if building.exists():
         raise FileExistsError(f"stale building directory exists: {building}")
     source_counts = {"V3_gold": 0, "ZXing_ZA": 0}
+    source_instance_counts = {"V3_gold": 0, "ZXing_ZA": 0}
     split_counts = {split: {"images": 0, "instances": 0} for split in SPLITS}
     total_instances = 0
     page_items: list[tuple[str, Image.Image]] = []
@@ -177,6 +205,7 @@ def export_accepted(dataset: Path, work: Path, output: Path,
 
                     source = _source_for(record, recovered)
                     source_counts[source] += 1
+                    source_instance_counts[source] += len(quads)
                     split_counts[record.split]["images"] += 1
                     split_counts[record.split]["instances"] += len(quads)
                     total_instances += len(quads)
@@ -236,6 +265,11 @@ def export_accepted(dataset: Path, work: Path, output: Path,
         if source_counts != {"V3_gold": expected_v3_images,
                              "ZXing_ZA": expected_za_images}:
             raise RuntimeError(f"unexpected source counts: {source_counts}")
+        if source_instance_counts != {
+                "V3_gold": expected_gold_instances,
+                "ZXing_ZA": expected_accepted_za_instances}:
+            raise RuntimeError(
+                f"unexpected source instance counts: {source_instance_counts}")
         if sum(x["images"] for x in split_counts.values()) != expected_images:
             raise RuntimeError("split image counts do not sum to expected total")
 
@@ -256,10 +290,17 @@ def export_accepted(dataset: Path, work: Path, output: Path,
         report = {
             "passed": True, "images": expected_images,
             "instances": total_instances, "sources": source_counts,
+            "source_instances": source_instance_counts,
             "splits": split_counts,
             "dropped_images": expected_dropped_images,
-            "dropped_instances": (recovery.get("ZB_instances", 0) +
-                                  recovery.get("ZM_instances", 0)),
+            "dropped_instances": expected_dropped_instances,
+            "dropped_non_za_instances": expected_dropped_non_za_instances,
+            "dropped_embedded_za_instances": expected_dropped_embedded_za_instances,
+            "audit_instance_grades": {
+                "ZA": recovery.get("ZA_instances", 0),
+                "ZB": recovery.get("ZB_instances", 0),
+                "ZM": recovery.get("ZM_instances", 0),
+            },
             "accepted_labels_source": str(work / "combined_proposed"),
             "old_dataset_txt_used_as_geometry": False,
             "original_inputs_unchanged": True,
@@ -282,10 +323,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-images", type=int, default=1027)
-    parser.add_argument("--expected-instances", type=int, default=1153)
+    parser.add_argument("--expected-instances", type=int, default=1144)
     parser.add_argument("--expected-dropped-images", type=int, default=192)
     parser.add_argument("--expected-v3-images", type=int, default=799)
     parser.add_argument("--expected-za-images", type=int, default=228)
+    parser.add_argument("--expected-gold-instances", type=int, default=915)
+    parser.add_argument("--expected-accepted-za-instances", type=int, default=229)
+    parser.add_argument("--expected-dropped-instances", type=int, default=246)
+    parser.add_argument("--expected-dropped-non-za-instances", type=int, default=237)
+    parser.add_argument("--expected-dropped-embedded-za-instances", type=int, default=9)
     parser.add_argument("--page-size", type=int, default=20)
     parser.add_argument("--columns", type=int, default=4)
     return parser
@@ -300,6 +346,12 @@ def main(argv=None) -> int:
         expected_dropped_images=args.expected_dropped_images,
         expected_v3_images=args.expected_v3_images,
         expected_za_images=args.expected_za_images,
+        expected_gold_instances=args.expected_gold_instances,
+        expected_accepted_za_instances=args.expected_accepted_za_instances,
+        expected_dropped_instances=args.expected_dropped_instances,
+        expected_dropped_non_za_instances=args.expected_dropped_non_za_instances,
+        expected_dropped_embedded_za_instances=(
+            args.expected_dropped_embedded_za_instances),
         page_size=args.page_size, columns=args.columns)
     print(json.dumps(result, sort_keys=True))
     return 0

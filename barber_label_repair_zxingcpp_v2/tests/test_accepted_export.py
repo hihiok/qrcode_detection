@@ -35,7 +35,10 @@ def _fixture(tmp_path):
     recovered.write_text(accepted_b.read_text(encoding="utf-8"), encoding="utf-8")
     write_json(work / "recovery_report.json", {
         "combined_proposed_images": 2, "combined_proposed_instances": 2,
-        "ZA_images": 1, "ZA_instances": 1,
+        # One additional ZA instance shares the dropped ZB image.  This mirrors
+        # the real audit: instance-grade ZA is not the same as accepted ZA.
+        "input_failed_instances": 3,
+        "ZA_images": 1, "ZA_instances": 2,
         "ZB_images": 1, "ZB_instances": 1,
         "ZM_images": 0, "ZM_instances": 0,
         "old_txt_geometry_used": False,
@@ -58,12 +61,19 @@ def test_export_accepted_is_self_contained_and_previews_every_image(tmp_path):
     report = export_accepted(
         dataset, work, output, expected_images=2, expected_instances=2,
         expected_dropped_images=1, expected_v3_images=1,
-        expected_za_images=1, page_size=2)
+        expected_za_images=1, expected_gold_instances=1,
+        expected_accepted_za_instances=1, expected_dropped_instances=2,
+        expected_dropped_non_za_instances=1,
+        expected_dropped_embedded_za_instances=1, page_size=2)
 
     assert report["passed"] is True
     assert report["images"] == 2
     assert report["instances"] == 2
     assert report["sources"] == {"V3_gold": 1, "ZXing_ZA": 1}
+    assert report["source_instances"] == {"V3_gold": 1, "ZXing_ZA": 1}
+    assert report["dropped_instances"] == 2
+    assert report["dropped_non_za_instances"] == 1
+    assert report["dropped_embedded_za_instances"] == 1
     assert report["old_dataset_txt_used_as_geometry"] is False
     assert len(list((output / "train" / "images").iterdir())) == 2
     assert len(list((output / "train" / "labels").glob("*.txt"))) == 2
@@ -90,4 +100,7 @@ def test_export_accepted_refuses_to_overwrite(tmp_path):
         export_accepted(
             dataset, work, output, expected_images=2, expected_instances=2,
             expected_dropped_images=1, expected_v3_images=1,
-            expected_za_images=1)
+            expected_za_images=1, expected_gold_instances=1,
+            expected_accepted_za_instances=1, expected_dropped_instances=2,
+            expected_dropped_non_za_instances=1,
+            expected_dropped_embedded_za_instances=1)
