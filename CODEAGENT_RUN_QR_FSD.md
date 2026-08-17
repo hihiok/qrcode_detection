@@ -11,7 +11,25 @@
 5. P0/P1/P2/P3 固定为二维码自身 TL/TR/BR/BL，不能按图像位置重新排序。
 6. priors 为 4720；bbox 只从角点派生，用于多 GT 匹配和 NMS。
 
-## 2. 获取代码
+## 2. 网络、代理、SSL 与获取代码
+
+执行任何 git/pip/curl 网络操作前，先读取服务器本地配置；不要把代理账号或密码提交到 GitHub：
+
+~~~bash
+test -f /mnt/ssd1/z00919662/qrcode_detection/proxy.md
+test -f /mnt/ssd1/z00919662/qrcode_detection/CODEAGENT_DISABLE_SSL.md
+sed -n '1,220p' /mnt/ssd1/z00919662/qrcode_detection/proxy.md
+sed -n '1,220p' /mnt/ssd1/z00919662/qrcode_detection/CODEAGENT_DISABLE_SSL.md
+~~~
+
+按这两个本地文件设置 http_proxy/https_proxy、Git proxy，并在公司证书链导致 clone 失败时，
+于 git clone 之前执行：
+
+~~~bash
+git config --global http.sslVerify false
+~~~
+
+仅用于该受控服务器环境；最终报告说明实际应用了哪些代理和 SSL 设置，但不得回显密码。
 
 首次执行：
 
@@ -43,15 +61,31 @@ git pull --ff-only
 ~~~bash
 export PROJECT_ROOT=/mnt/ssd1/z00919662/qrcode_detection
 export FSD_ROOT=/mnt/ssd1/z00919662/AI-face-detect/ultraface_3323_ref_param
-export BARBER_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_multi_240x320_rotation_validated
+export BARBER_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_accepted_1027_240x320
 export BOOFCV_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/boofcv_qr_multi_240x320_rotation_validated
 export MENDELEY_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/mendeley_qr_multi_240x320_rotation_validated
+
+# 旧合成集：CodeAgent 报告为 4000/400/400，但未记录迁移后的最终 /mnt/ssd1 完整路径。
+# 优先检查项目内最可能路径；仅在内容强校验通过后使用。禁止静默重建或覆盖。
+export SYNTH_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/qr_single_240x320
+export LEGACY_SYNTH_ROOT=/data/pub1/z00919662/dataset/qr_single_240x320
+if [ ! -f "$SYNTH_ROOT/train/annotations.jsonl" ]; then
+  if [ -f "$LEGACY_SYNTH_ROOT/train/annotations.jsonl" ]; then
+    export SYNTH_ROOT="$LEGACY_SYNTH_ROOT"
+  else
+    echo "ERROR: existing 4800-image synthetic dataset not found at either documented candidate" >&2
+    echo "Manual action required: locate the original dataset; do not regenerate it." >&2
+    exit 2
+  fi
+fi
+
 export OLD_QR_CHECKPOINT=$FSD_ROOT/models/qr_fsd_240x320_corners8/qr_fsd_best.pth
 export OUTPUT_DIR=$FSD_ROOT/models/qr_fsd_multi_yuv
 cd "$PROJECT_ROOT"
 ~~~
 
-确认 $FSD_ROOT/vision/ssd/mb_tiny_RFB_fd_3.py 存在，并确认以上三个数据集目录均存在。
+确认 $FSD_ROOT/vision/ssd/mb_tiny_RFB_fd_3.py 存在，并确认以上四个数据集目录均存在。
+合成集必须严格核对 train=4000、val=400、test=400；若数量不同，停止并人工确认。
 
 ## 4. 静态与单元测试
 
@@ -109,25 +143,30 @@ python validate_qr_dataset.py --data-root "$DATA_ROOT" --visualize 50
 报告 train/val/test 的图片数、二维码实例数、0 二维码负样本数和每图二维码数量直方图。
 同一视频相邻帧不能跨 train/val/test。
 
-### 5.1 已准备好的真实多二维码数据集
+### 5.1 已准备好的真实数据集与旧合成集
 
-正式训练必须联合使用以下三个已经完成方向解析和旋转一致性验证的数据集：
+正式训练必须联合使用以下三个已经完成方向解析和旋转一致性验证的真实数据集：
 
 ~~~text
-/mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_multi_240x320_rotation_validated
+/mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_accepted_1027_240x320
 /mnt/ssd1/z00919662/qrcode_detection/dataset/boofcv_qr_multi_240x320_rotation_validated
 /mnt/ssd1/z00919662/qrcode_detection/dataset/mendeley_qr_multi_240x320_rotation_validated
 ~~~
 
+另外加入此前训练使用的单二维码合成集。旧文档记录的原路径为
+`/data/pub1/z00919662/dataset/qr_single_240x320`，但训练报告说明实际改用了
+`/mnt/ssd1`。因此必须先按第3节定位并验证 `$SYNTH_ROOT`，不得凭目录名猜测，
+不得重新生成后冒充旧训练集。
+
 每个根目录必须包含 `train/annotations.jsonl`、`val/annotations.jsonl` 和
 `test/annotations.jsonl`，图片路径相对各自 split 目录。不要重新推断或按图像坐标重排
-P0/P1/P2/P3，也不要覆盖这三个已验证源目录。训练脚本允许重复传入
+P0/P1/P2/P3，也不要覆盖四个源目录。训练脚本允许重复传入
 `--data-root`，会分别加载各数据源并用 `ConcatDataset` 合并 train 和 val。
 
 正式训练前逐一执行：
 
 ~~~bash
-for dataset_root in "$BARBER_ROOT" "$BOOFCV_ROOT" "$MENDELEY_ROOT"; do
+for dataset_root in "$BARBER_ROOT" "$BOOFCV_ROOT" "$MENDELEY_ROOT" "$SYNTH_ROOT"; do
   test -f "$dataset_root/train/annotations.jsonl"
   test -f "$dataset_root/val/annotations.jsonl"
   test -f "$dataset_root/test/annotations.jsonl"
@@ -135,8 +174,9 @@ for dataset_root in "$BARBER_ROOT" "$BOOFCV_ROOT" "$MENDELEY_ROOT"; do
 done
 ~~~
 
-检查跨数据源和跨 split 的图片 SHA256；同一张图及同一视频的相邻帧不得跨
-train/val/test。报告各数据源每个 split 的图片数、二维码实例数、负样本数和
+额外断言合成集 train/val/test 图片数分别为 4000/400/400。检查跨数据源和跨 split
+的图片 SHA256；同一张图及同一视频的相邻帧不得跨 train/val/test。
+报告各数据源每个 split 的图片数、二维码实例数、负样本数和
 每图实例数直方图。若某个目录结构不符合规范，先停止并在报告中说明，不得静默跳过。
 
 ## 6. 多二维码合成冒烟数据
@@ -184,6 +224,7 @@ CUDA_VISIBLE_DEVICES=0,1 nohup python -u train_fsd_qr.py \
   --data-root "$BARBER_ROOT" \
   --data-root "$BOOFCV_ROOT" \
   --data-root "$MENDELEY_ROOT" \
+  --data-root "$SYNTH_ROOT" \
   --checkpoint-dir "$OUTPUT_DIR" \
   --resume "$OLD_QR_CHECKPOINT" \
   --input-mode yuv --input-size-key 240 \
@@ -234,7 +275,7 @@ python infer_video.py \
 在 $OUTPUT_DIR/CODEAGENT_REPORT.md 写明：
 
 - 实际 commit、路径、Python/PyTorch/CUDA/GPU
-- 三个 split 的图片/实例/负样本统计
+- 四个数据源各 split 的图片/实例/负样本统计；合成集必须确认 4000/400/400
 - YUV transform 数值范围与首层 1→3 加载日志
 - 模型输入输出 shape 与 4720 priors
 - best epoch、训练/验证曲线
