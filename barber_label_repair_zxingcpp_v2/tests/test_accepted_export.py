@@ -104,3 +104,46 @@ def test_export_accepted_refuses_to_overwrite(tmp_path):
             expected_accepted_za_instances=1, expected_dropped_instances=2,
             expected_dropped_non_za_instances=1,
             expected_dropped_embedded_za_instances=1)
+
+
+def test_export_accepted_drops_whole_out_of_bounds_image_without_clipping(tmp_path):
+    dataset, work, *_ = _fixture(tmp_path)
+    _make_image(dataset, "edge", "blue")
+    edge = work / "combined_proposed" / "train" / "labels" / "edge.txt"
+    edge.write_text("0 .8 .1 1.01 .1 1.01 .8 .8 .8\n", encoding="utf-8")
+    write_json(work / "recovery_report.json", {
+        "combined_proposed_images": 3, "combined_proposed_instances": 3,
+        "input_failed_instances": 3,
+        "ZA_images": 1, "ZA_instances": 2,
+        "ZB_images": 1, "ZB_instances": 1,
+        "ZM_images": 0, "ZM_instances": 0,
+        "old_txt_geometry_used": False,
+    })
+    output = tmp_path / "accepted"
+    kwargs = dict(
+        expected_images=3, expected_instances=3, expected_dropped_images=1,
+        expected_v3_images=2, expected_za_images=1,
+        expected_gold_instances=2, expected_accepted_za_instances=1,
+        expected_dropped_instances=2, expected_dropped_non_za_instances=1,
+        expected_dropped_embedded_za_instances=1, page_size=2)
+    with pytest.raises(RuntimeError, match="rerun only with explicit"):
+        export_accepted(dataset, work, output, **kwargs)
+    assert not output.exists()
+
+    report = export_accepted(
+        dataset, work, output, drop_out_of_bounds=True, **kwargs)
+    assert report["candidate_images"] == 3
+    assert report["candidate_instances"] == 3
+    assert report["candidate_sources"] == {"V3_gold": 2, "ZXing_ZA": 1}
+    assert report["candidate_source_instances"] == {"V3_gold": 2, "ZXing_ZA": 1}
+    assert report["images"] == 2
+    assert report["instances"] == 2
+    assert report["additional_boundary_dropped_images"] == 1
+    assert report["additional_boundary_dropped_instances"] == 1
+    assert report["dropped_images"] == 2
+    assert report["dropped_instances"] == 3
+    assert not (output / "train" / "images" / "edge.png").exists()
+    rejected = json.loads((output / "boundary_rejections.jsonl").read_text())
+    assert rejected["image_id"] == "train/edge"
+    assert rejected["outside_points"][0]["x"] == pytest.approx(242.4)
+    assert rejected["policy"] == "drop_entire_image_no_coordinate_clipping"

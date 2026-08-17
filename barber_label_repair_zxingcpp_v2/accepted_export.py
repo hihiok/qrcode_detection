@@ -105,6 +105,14 @@ def _source_for(record: ImageRecord, recovered: set[tuple[str, str]]) -> str:
     return "ZXing_ZA" if (record.split, record.stem) in recovered else "V3_gold"
 
 
+def _ordered_keys(accepted: dict[tuple[str, str], Path]) -> list[tuple[str, str]]:
+    return [
+        (split, stem) for split in SPLITS
+        for stem in sorted(value for current_split, value in accepted
+                           if current_split == split)
+    ]
+
+
 def export_accepted(dataset: Path, work: Path, output: Path,
                     expected_images: int = 1027, expected_instances: int = 1144,
                     expected_dropped_images: int = 192,
@@ -114,7 +122,8 @@ def export_accepted(dataset: Path, work: Path, output: Path,
                     expected_dropped_instances: int = 246,
                     expected_dropped_non_za_instances: int = 237,
                     expected_dropped_embedded_za_instances: int = 9,
-                    page_size: int = 20, columns: int = 4) -> dict:
+                    page_size: int = 20, columns: int = 4,
+                    drop_out_of_bounds: bool = False) -> dict:
     if output.exists():
         raise FileExistsError(f"refusing to overwrite output: {output}")
     if page_size < 1 or columns < 1:
@@ -142,6 +151,74 @@ def export_accepted(dataset: Path, work: Path, output: Path,
     if len(failure_ids) != expected_dropped_images:
         raise RuntimeError(
             f"failure report images {len(failure_ids)} != {expected_dropped_images}")
+
+    ordered_keys = _ordered_keys(accepted)
+    candidate_quads = {}
+    candidate_source_counts = {"V3_gold": 0, "ZXing_ZA": 0}
+    candidate_source_instances = {"V3_gold": 0, "ZXing_ZA": 0}
+    boundary_rejections = []
+    for key in ordered_keys:
+        record = records.get(key)
+        if record is None:
+            raise FileNotFoundError(f"accepted label has no source image: {key}")
+        image = open_rgb(record.image_path)
+        if image.size != (240, 320):
+            raise ValueError(f"unexpected image size {record.image_id}: {image.size}")
+        quads = parse_label(accepted[key], *image.size)
+        source = _source_for(record, recovered)
+        candidate_source_counts[source] += 1
+        candidate_source_instances[source] += len(quads)
+        outside = []
+        for instance_index, quad in enumerate(quads):
+            issue = quad_geometry_issue(quad.points)
+            if issue is not None:
+                raise ValueError(f"invalid accepted quad {record.image_id}: {issue}")
+            for point_index, (x, y) in enumerate(quad.points):
+                if x < 0 or x >= image.width or y < 0 or y >= image.height:
+                    outside.append({
+                        "instance": instance_index, "point": point_index,
+                        "x": float(x), "y": float(y),
+                    })
+        if outside:
+            boundary_rejections.append({
+                "image_id": record.image_id, "source": source,
+                "instances": len(quads), "image_width": image.width,
+                "image_height": image.height, "outside_points": outside,
+                "policy": "drop_entire_image_no_coordinate_clipping",
+            })
+        else:
+            candidate_quads[key] = quads
+
+    if candidate_source_counts != {"V3_gold": expected_v3_images,
+                                   "ZXing_ZA": expected_za_images}:
+        raise RuntimeError(f"unexpected candidate source counts: {candidate_source_counts}")
+    if candidate_source_instances != {
+            "V3_gold": expected_gold_instances,
+            "ZXing_ZA": expected_accepted_za_instances}:
+        raise RuntimeError(
+            f"unexpected candidate source instances: {candidate_source_instances}")
+    if boundary_rejections and not drop_out_of_bounds:
+        first = boundary_rejections[0]["image_id"]
+        raise RuntimeError(
+            f"{len(boundary_rejections)} accepted images have out-of-bounds points; "
+            f"first={first}; rerun only with explicit --drop-out-of-bounds")
+
+    boundary_rejected_instances = sum(row["instances"] for row in boundary_rejections)
+    exported_images = expected_images - len(boundary_rejections)
+    exported_instances = expected_instances - boundary_rejected_instances
+    rejected_source_counts = {"V3_gold": 0, "ZXing_ZA": 0}
+    rejected_source_instances = {"V3_gold": 0, "ZXing_ZA": 0}
+    for row in boundary_rejections:
+        rejected_source_counts[row["source"]] += 1
+        rejected_source_instances[row["source"]] += row["instances"]
+    expected_output_source_counts = {
+        key: candidate_source_counts[key] - rejected_source_counts[key]
+        for key in candidate_source_counts
+    }
+    expected_output_source_instances = {
+        key: candidate_source_instances[key] - rejected_source_instances[key]
+        for key in candidate_source_instances
+    }
 
     immutable_paths = []
     for key, label in accepted.items():
@@ -181,27 +258,13 @@ def export_accepted(dataset: Path, work: Path, output: Path,
                 annotation_handles[split] = path.open("w", encoding="utf-8")
             manifest = (building / "accepted_manifest.jsonl").open("w", encoding="utf-8")
             try:
-                ordered_keys = [
-                    (split, stem) for split in SPLITS
-                    for stem in sorted(value for current_split, value in accepted
-                                       if current_split == split)
-                ]
                 for key in ordered_keys:
+                    if key not in candidate_quads:
+                        continue
                     record = records[key]
                     accepted_label = accepted[key]
                     image = open_rgb(record.image_path)
-                    if image.size != (240, 320):
-                        raise ValueError(f"unexpected image size {record.image_id}: {image.size}")
-                    quads = parse_label(accepted_label, *image.size)
-                    for quad in quads:
-                        issue = quad_geometry_issue(quad.points)
-                        if issue is not None:
-                            raise ValueError(f"invalid accepted quad {record.image_id}: {issue}")
-                        if (quad.points[:, 0].min() < 0 or
-                                quad.points[:, 0].max() >= image.width or
-                                quad.points[:, 1].min() < 0 or
-                                quad.points[:, 1].max() >= image.height):
-                            raise ValueError(f"accepted point outside image: {record.image_id}")
+                    quads = candidate_quads[key]
 
                     source = _source_for(record, recovered)
                     source_counts[source] += 1
@@ -259,22 +322,24 @@ def export_accepted(dataset: Path, work: Path, output: Path,
             for handle in annotation_handles.values():
                 handle.close()
 
-        if total_instances != expected_instances:
+        if total_instances != exported_instances:
             raise RuntimeError(
-                f"accepted instance count {total_instances} != {expected_instances}")
-        if source_counts != {"V3_gold": expected_v3_images,
-                             "ZXing_ZA": expected_za_images}:
+                f"accepted instance count {total_instances} != {exported_instances}")
+        if source_counts != expected_output_source_counts:
             raise RuntimeError(f"unexpected source counts: {source_counts}")
-        if source_instance_counts != {
-                "V3_gold": expected_gold_instances,
-                "ZXing_ZA": expected_accepted_za_instances}:
+        if source_instance_counts != expected_output_source_instances:
             raise RuntimeError(
                 f"unexpected source instance counts: {source_instance_counts}")
-        if sum(x["images"] for x in split_counts.values()) != expected_images:
+        if sum(x["images"] for x in split_counts.values()) != exported_images:
             raise RuntimeError("split image counts do not sum to expected total")
 
+        with (building / "boundary_rejections.jsonl").open(
+                "w", encoding="utf-8") as handle:
+            for row in boundary_rejections:
+                append_jsonl(handle, row)
+
         preview_report = {
-            "passed": True, "images": expected_images,
+            "passed": True, "images": exported_images,
             "instances": total_instances,
             "per_image_previews": len(preview_records),
             "page_size": page_size, "pages": len(preview_pages),
@@ -288,14 +353,25 @@ def export_accepted(dataset: Path, work: Path, output: Path,
         write_json(building / "preview" / "preview_report.json", preview_report)
 
         report = {
-            "passed": True, "images": expected_images,
+            "passed": True,
+            "candidate_images": expected_images,
+            "candidate_instances": expected_instances,
+            "candidate_sources": candidate_source_counts,
+            "candidate_source_instances": candidate_source_instances,
+            "images": exported_images,
             "instances": total_instances, "sources": source_counts,
             "source_instances": source_instance_counts,
             "splits": split_counts,
-            "dropped_images": expected_dropped_images,
-            "dropped_instances": expected_dropped_instances,
+            "audit_dropped_images": expected_dropped_images,
+            "audit_dropped_instances": expected_dropped_instances,
+            "additional_boundary_dropped_images": len(boundary_rejections),
+            "additional_boundary_dropped_instances": boundary_rejected_instances,
+            "dropped_images": expected_dropped_images + len(boundary_rejections),
+            "dropped_instances": (expected_dropped_instances +
+                                  boundary_rejected_instances),
             "dropped_non_za_instances": expected_dropped_non_za_instances,
             "dropped_embedded_za_instances": expected_dropped_embedded_za_instances,
+            "boundary_rejections": "boundary_rejections.jsonl",
             "audit_instance_grades": {
                 "ZA": recovery.get("ZA_instances", 0),
                 "ZB": recovery.get("ZB_instances", 0),
@@ -334,6 +410,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-dropped-embedded-za-instances", type=int, default=9)
     parser.add_argument("--page-size", type=int, default=20)
     parser.add_argument("--columns", type=int, default=4)
+    parser.add_argument("--drop-out-of-bounds", action="store_true")
     return parser
 
 
@@ -352,7 +429,8 @@ def main(argv=None) -> int:
         expected_dropped_non_za_instances=args.expected_dropped_non_za_instances,
         expected_dropped_embedded_za_instances=(
             args.expected_dropped_embedded_za_instances),
-        page_size=args.page_size, columns=args.columns)
+        page_size=args.page_size, columns=args.columns,
+        drop_out_of_bounds=args.drop_out_of_bounds)
     print(json.dumps(result, sort_keys=True))
     return 0
 

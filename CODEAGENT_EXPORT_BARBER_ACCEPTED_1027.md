@@ -1,4 +1,4 @@
-# CodeAgent：导出 BarBeR 1027 张已接受数据与完整预览
+# CodeAgent：过滤 BarBeR 1027 个候选并导出完整预览
 
 ## 目标
 
@@ -7,12 +7,17 @@
 - V3 人工 gold：799 张、915 个实例；
 - ZXing 全图 ZA 自动通过：228 张、229 个实例。
 
-最终导出 1027 张图片、1144 个二维码实例。明确按整图丢弃全部 ZB/ZM 图片：192
+输入候选为1027张图片、1144个二维码实例。明确按整图丢弃全部 ZB/ZM 图片：192
 张、246 个实例。被丢弃的图片中有237个ZB/ZM实例，以及与它们同图的9个ZA实例。
 Audit报告中的 `ZA_instances=238` 是实例级统计，不等于最终保留的ZA实例数：只有
 位于全图ZA图片中的229个实例被保留。输出必须是新的自包含数据集，包含
 `images/`、`labels/`、重建后的
-`annotations.jsonl`、1027 张单图预览和覆盖全部图片的分页总览。
+`annotations.jsonl`、每张输出图片的单图预览和覆盖全部输出图片的分页总览。
+
+候选标签中可能存在真实角点略微超出240×320画面的截断二维码。训练数据不允许
+使用画外角点，也不得把坐标强行 clip 到边界。程序必须先扫描全部1027个候选，凡
+任意角点超出 `[0,240) × [0,320)`，按整图额外丢弃并写入
+`boundary_rejections.jsonl`。最终输出图片数和实例数由完整扫描结果决定。
 
 不得把原数据集旧 TXT 当作角点来源。导出标签只能来自已通过 validation 的
 `combined_proposed`。
@@ -98,13 +103,14 @@ python -m pip install --no-cache-dir \
 python -m pytest -q barber_label_repair_zxingcpp_v2/tests
 ```
 
-必须至少 21 项测试全部通过，其中包括：
+必须至少 22 项测试全部通过，其中包括：
 
 - 不复制旧 dataset TXT 顺序；
 - ZB/ZM 不能进入 accepted 输出；
 - 输出存在时拒绝覆盖；
 - `annotations.jsonl` 使用 `combined_proposed` 的 P0-P3；
 - 每张已接受图片都有单图预览。
+- 画外角点不会被clip，而是整张隔离并记录精确坐标。
 
 ## 3. 输入报告门禁
 
@@ -128,7 +134,7 @@ test ! -e "$QR_OUTPUT"
 - 整图丢弃246实例，其中237个为ZB/ZM、9个为同图ZA；
 - `recovery_failures.jsonl` 中的任何 image_id 都不能进入 accepted 集。
 
-## 4. 导出新数据集和1027张预览
+## 4. 扫描1027个候选并导出边界内数据
 
 ```bash
 set -o pipefail
@@ -146,6 +152,7 @@ python -m barber_label_repair_zxingcpp_v2.accepted_export \
   --expected-dropped-instances 246 \
   --expected-dropped-non-za-instances 237 \
   --expected-dropped-embedded-za-instances 9 \
+  --drop-out-of-bounds \
   --page-size 20 \
   --columns 4 \
   2>&1 | tee "$QR_OUTPUT.export_console.log"
@@ -166,11 +173,12 @@ $QR_OUTPUT/
     annotations.jsonl
   accepted_manifest.jsonl
   accepted_export_report.json
+  boundary_rejections.jsonl
   preview/
     preview_report.json
     preview_manifest.jsonl
     per_image/train|val|test/*.jpg
-    pages/accepted_page_001.jpg ... accepted_page_052.jpg
+    pages/accepted_page_001.jpg ...
 ```
 
 ## 5. 强制验收
@@ -185,21 +193,31 @@ report = json.loads((root / "accepted_export_report.json").read_text())
 preview = json.loads((root / "preview" / "preview_report.json").read_text())
 
 assert report["passed"] is True, report
-assert report["images"] == 1027, report
-assert report["instances"] == 1144, report
-assert report["sources"] == {"V3_gold": 799, "ZXing_ZA": 228}, report
-assert report["source_instances"] == {"V3_gold": 915, "ZXing_ZA": 229}, report
-assert report["dropped_images"] == 192, report
-assert report["dropped_instances"] == 246, report
+assert report["candidate_images"] == 1027, report
+assert report["candidate_instances"] == 1144, report
+assert report["candidate_sources"] == {"V3_gold": 799, "ZXing_ZA": 228}, report
+assert report["candidate_source_instances"] == {"V3_gold": 915, "ZXing_ZA": 229}, report
+extra_images = report["additional_boundary_dropped_images"]
+extra_instances = report["additional_boundary_dropped_instances"]
+assert extra_images >= 1, report
+assert extra_instances >= extra_images, report
+assert report["images"] == 1027 - extra_images, report
+assert report["instances"] == 1144 - extra_instances, report
+assert sum(report["sources"].values()) == report["images"], report
+assert sum(report["source_instances"].values()) == report["instances"], report
+assert report["audit_dropped_images"] == 192, report
+assert report["audit_dropped_instances"] == 246, report
+assert report["dropped_images"] == 192 + extra_images, report
+assert report["dropped_instances"] == 246 + extra_instances, report
 assert report["dropped_non_za_instances"] == 237, report
 assert report["dropped_embedded_za_instances"] == 9, report
 assert report["old_dataset_txt_used_as_geometry"] is False, report
 assert report["original_inputs_unchanged"] is True, report
 assert preview["passed"] is True, preview
-assert preview["images"] == 1027, preview
-assert preview["instances"] == 1144, preview
-assert preview["per_image_previews"] == 1027, preview
-assert preview["pages"] == 52, preview
+assert preview["images"] == report["images"], preview
+assert preview["instances"] == report["instances"], preview
+assert preview["per_image_previews"] == report["images"], preview
+assert preview["pages"] == (report["images"] + 19) // 20, preview
 
 images = sum(1 for split in ("train", "val", "test")
              for p in (root / split / "images").iterdir() if p.is_file())
@@ -209,7 +227,10 @@ annotations = sum(len((root / split / "annotations.jsonl").read_text().splitline
                   for split in ("train", "val", "test"))
 per_image = len(list((root / "preview" / "per_image").rglob("*.jpg")))
 pages = len(list((root / "preview" / "pages").glob("accepted_page_*.jpg")))
-assert (images, labels, annotations, per_image, pages) == (1027, 1027, 1027, 1027, 52)
+assert images == labels == annotations == per_image == report["images"]
+assert pages == preview["pages"]
+rejections = (root / "boundary_rejections.jsonl").read_text().splitlines()
+assert len(rejections) == extra_images
 print(json.dumps(report, indent=2, sort_keys=True))
 print(json.dumps(preview, indent=2, sort_keys=True))
 PY
@@ -228,12 +249,14 @@ git diff --exit-code
 
 - branch、精确 commit、测试数量；
 - 输出路径；
-- 1027张/1144实例；
-- V3 799张/915实例、全图ZA 228张/229实例；
+- 输入候选1027张/1144实例；
+- 候选来源：V3 799张/915实例、全图ZA 228张/229实例；
 - 丢弃 ZB/ZM 图片192张/246实例，其中237个ZB/ZM实例、9个同图ZA实例；
+- 新增边界越界整图丢弃数量、实例数及完整 `boundary_rejections.jsonl`；
+- 最终输出图片数、实例数及V3/ZA分别保留数量；
 - train/val/test 各自图片和实例数；
-- `annotations.jsonl`、labels、images 各1027；
-- 单图预览1027张、分页总览52页；
+- `annotations.jsonl`、labels、images与最终输出图片数完全一致；
+- 单图预览与最终输出图片数一致，并报告实际分页总览页数；
 - 第一页与最后一页完整路径；
 - 原数据、原work、Git仓库均未改变。
 
