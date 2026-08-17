@@ -65,19 +65,8 @@ export BARBER_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_accept
 export BOOFCV_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/boofcv_qr_multi_240x320_rotation_validated
 export MENDELEY_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/mendeley_qr_multi_240x320_rotation_validated
 
-# 旧合成集：CodeAgent 报告为 4000/400/400，但未记录迁移后的最终 /mnt/ssd1 完整路径。
-# 优先检查项目内最可能路径；仅在内容强校验通过后使用。禁止静默重建或覆盖。
-export SYNTH_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/qr_single_240x320
-export LEGACY_SYNTH_ROOT=/data/pub1/z00919662/dataset/qr_single_240x320
-if [ ! -f "$SYNTH_ROOT/train/annotations.jsonl" ]; then
-  if [ -f "$LEGACY_SYNTH_ROOT/train/annotations.jsonl" ]; then
-    export SYNTH_ROOT="$LEGACY_SYNTH_ROOT"
-  else
-    echo "ERROR: existing 4800-image synthetic dataset not found at either documented candidate" >&2
-    echo "Manual action required: locate the original dataset; do not regenerate it." >&2
-    exit 2
-  fi
-fi
+# 此路径已由用户在服务器确认；直接使用现有 4000/400/400 合成数据，禁止重新生成或覆盖。
+export SYNTH_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset/qr_full_data
 
 export OLD_QR_CHECKPOINT=$FSD_ROOT/models/qr_fsd_240x320_corners8/qr_fsd_best.pth
 export OUTPUT_DIR=$FSD_ROOT/models/qr_fsd_multi_yuv
@@ -145,7 +134,7 @@ python validate_qr_dataset.py --data-root "$DATA_ROOT" --visualize 50
 
 ### 5.1 已准备好的真实数据集与旧合成集
 
-正式训练必须联合使用以下三个已经完成方向解析和旋转一致性验证的真实数据集：
+正式训练必须联合使用以下三个已经完成方向解析和旋转一致性验证的真实数据集，并加入下方一个合成数据集：
 
 ~~~text
 /mnt/ssd1/z00919662/qrcode_detection/dataset/barber_qr_accepted_1027_240x320
@@ -153,10 +142,14 @@ python validate_qr_dataset.py --data-root "$DATA_ROOT" --visualize 50
 /mnt/ssd1/z00919662/qrcode_detection/dataset/mendeley_qr_multi_240x320_rotation_validated
 ~~~
 
-另外加入此前训练使用的单二维码合成集。旧文档记录的原路径为
-`/data/pub1/z00919662/dataset/qr_single_240x320`，但训练报告说明实际改用了
-`/mnt/ssd1`。因此必须先按第3节定位并验证 `$SYNTH_ROOT`，不得凭目录名猜测，
-不得重新生成后冒充旧训练集。
+另外加入此前训练使用、现已确认路径的单二维码合成集：
+
+~~~text
+/mnt/ssd1/z00919662/qrcode_detection/dataset/qr_full_data
+~~~
+
+因此正式训练固定为“三个真实数据集 + 一个合成数据集”。必须验证 `$SYNTH_ROOT`
+的 train/val/test 图片数为 4000/400/400，禁止重新生成或覆盖。
 
 每个根目录必须包含 `train/annotations.jsonl`、`val/annotations.jsonl` 和
 `test/annotations.jsonl`，图片路径相对各自 split 目录。不要重新推断或按图像坐标重排
