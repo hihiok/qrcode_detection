@@ -4,11 +4,21 @@ import json
 from PIL import Image
 import zxingcpp
 
-from barber_label_repair_zxingcpp_v2.data import ImageRecord, Quad
+from barber_label_repair_zxingcpp_v2.data import ImageRecord, Quad, parse_label
 from barber_label_repair_zxingcpp_v2.detector import ZXingSafeDetector
 from barber_label_repair_zxingcpp_v2.pipeline import (
     Config, audit, calibration_views, scan_quad,
 )
+from barber_label_repair_zxingcpp_v2.vgg_geometry import VGGGeometryImage
+
+
+def geometry_for(record, quads):
+    return VGGGeometryImage(
+        image_id=record.image_id, source_rel="source.png",
+        source_image=record.image_path, source_output_ssim=1.0,
+        runner_up_ssim=None, transform={}, quads=tuple(quads),
+        objects=tuple({"instance_id": f"{record.image_id}#vgg_{i}"}
+                      for i in range(len(quads))), invalid_objects=())
 
 
 def test_real_zxing_detection_and_negative_control():
@@ -65,11 +75,15 @@ def test_end_to_end_single_image_audit_reuses_manual_tokens(tmp_path):
     original_line = "0 " + " ".join(v for pair in tokens for v in pair)
     label_path.write_text(original_line + "\n", encoding="utf-8")
     record = ImageRecord("train", "fixture", image_path, label_path)
+    quad = parse_label(label_path, *image.size)[0]
+    # Legacy processed TXT is deliberately wrong. Audit must use VGG geometry.
+    label_path.write_text("0 .01 .01 .20 .01 .20 .20 .01 .20\n", encoding="utf-8")
     work = tmp_path / "work"
     work.mkdir()
     report = audit(
         Config(tmp_path, tmp_path / "v3", work, allow_count_mismatch=True),
-        detector, [record], {}, (0, 1, 2, 3), False)
+        detector, [record], {}, {record.image_id: geometry_for(record, [quad])},
+        (0, 1, 2, 3), False)
     assert report["ZA_images"] == 1
     recovered = work / "recovered_labels" / "train" / "labels" / "fixture.txt"
     assert recovered.read_text(encoding="utf-8").strip() == original_line
@@ -94,6 +108,7 @@ def test_audit_isolates_degenerate_instance_and_removes_stale_output(tmp_path):
     degenerate = "0 1.0 0.1 1.0 0.2 1.0 0.3 1.0 0.4"
     label_path.write_text(valid + "\n" + degenerate + "\n", encoding="utf-8")
     record = ImageRecord("train", "mixed", image_path, label_path)
+    quads = parse_label(label_path, *image.size)
     work = tmp_path / "work"
     stale = work / "recovered_labels" / "train" / "labels" / "stale.txt"
     stale.parent.mkdir(parents=True)
@@ -101,7 +116,8 @@ def test_audit_isolates_degenerate_instance_and_removes_stale_output(tmp_path):
     report = audit(
         Config(tmp_path, tmp_path / "v3", work, expect_gold_instances=0,
                allow_count_mismatch=True),
-        detector, [record], {}, (0, 1, 2, 3), False)
+        detector, [record], {}, {record.image_id: geometry_for(record, quads)},
+        (0, 1, 2, 3), False)
     assert report["ZA_instances"] == 1
     assert report["ZM_instances"] == 1
     assert report["ZM_images"] == 1
@@ -111,8 +127,8 @@ def test_audit_isolates_degenerate_instance_and_removes_stale_output(tmp_path):
     review = json.loads(
         (work / "review_grade_zm" / "train" / "mixed.json").read_text())
     assert review["instances"][1]["facts"] == {
-        "reason": "invalid_manual_quad",
+        "reason": "invalid_vgg_quad_after_transform",
         "geometry_issue": "bbox_width_lt_4px",
-        "manual_points": [[240.0, 32.0], [240.0, 64.0],
-                          [240.0, 96.0], [240.0, 128.0]],
+        "vgg_points": [[240.0, 32.0], [240.0, 64.0],
+                       [240.0, 96.0], [240.0, 128.0]],
     }

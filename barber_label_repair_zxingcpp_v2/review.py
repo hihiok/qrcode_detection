@@ -12,6 +12,7 @@ from .data import (append_jsonl, discover_dataset, file_hash, open_rgb,
                    parse_label, snapshot, write_json)
 from .geometry import quad_geometry_issue
 from .pipeline import Config, image_records, immutable_paths
+from .vgg_geometry import load_geometry
 
 
 COLORS = ("#ff3030", "#28b463", "#2471a3", "#f4d03f")
@@ -42,8 +43,11 @@ def annotate_record(image: Image.Image, quads, report: dict, scale: int = 2) -> 
                           Image.Resampling.NEAREST).convert("RGB")
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.load_default()
+    indexed = {inst.get("geometry_index"): inst
+               for inst in report.get("instances", [])
+               if inst.get("geometry_index") is not None}
     for index, quad in enumerate(quads):
-        inst = report["instances"][index] if index < len(report["instances"]) else {}
+        inst = indexed.get(index, {})
         order = inst.get("semantic_to_manual")
         semantic_at_manual = ({int(manual): semantic
                                for semantic, manual in enumerate(order)}
@@ -85,6 +89,7 @@ def make_sheet(items: list[tuple[str, Image.Image]], output: Path,
 
 def build_review_pack(dataset: Path, work: Path, page_size: int = 20) -> dict:
     records = {r.image_id: r for r in discover_dataset(dataset)}
+    geometry_by_id = load_geometry(work)
     failures = read_jsonl(work / "recovery_failures.jsonl")
     preview_root = work / "manual_review_pack" / "previews"
     if preview_root.exists():
@@ -98,10 +103,13 @@ def build_review_pack(dataset: Path, work: Path, page_size: int = 20) -> dict:
             image_id = report["image_id"]
             rec = records[image_id]
             image = open_rgb(rec.image_path)
+            geometry = geometry_by_id.get(image_id)
             try:
-                quads = parse_label(rec.label_path, *image.size)
+                quads = list(geometry.quads) if geometry is not None else []
                 annotated = annotate_record(image, quads, report)
-            except ValueError:
+                if not quads:
+                    annotated = image.resize((image.width * 2, image.height * 2))
+            except (ValueError, IndexError):
                 annotated = image.resize((image.width * 2, image.height * 2))
             grade = report.get("grade", "ZM")
             grade_items.setdefault(grade, []).append((image_id, annotated))
@@ -114,7 +122,9 @@ def build_review_pack(dataset: Path, work: Path, page_size: int = 20) -> dict:
                            for inst in report.get("instances", [])],
                 "instance_grades": [inst.get("grade")
                                     for inst in report.get("instances", [])],
-                "note": "Use approve_suggestion, manual_order, or corrected_label."
+                "geometry_source": "barber_vgg_manual_polygon",
+                "note": "Use approve_suggestion/manual_order only for valid VGG quads; "
+                        "invalid or unresolved VGG geometry requires corrected_label."
             })
     pages = []
     for grade, items in grade_items.items():
@@ -131,7 +141,8 @@ def build_review_pack(dataset: Path, work: Path, page_size: int = 20) -> dict:
     return report
 
 
-def decision_label(rec, image, decision: dict, failure: dict, work: Path) -> tuple[Path | None, str | None]:
+def decision_label(rec, image, geometry, decision: dict, failure: dict,
+                   work: Path) -> tuple[Path | None, str | None]:
     reviewer = str(decision.get("reviewer", "")).strip()
     if not reviewer:
         return None, "reviewer is empty"
@@ -141,10 +152,11 @@ def decision_label(rec, image, decision: dict, failure: dict, work: Path) -> tup
         if not path.is_file():
             return None, f"missing corrected label: {path}"
         return path, None
-    try:
-        quads = parse_label(rec.label_path, *image.size)
-    except ValueError as exc:
-        return None, f"original label cannot be reordered: {exc}"
+    if geometry is None:
+        return None, "VGG geometry unresolved; use corrected_label"
+    if geometry.invalid_objects:
+        return None, "VGG geometry contains invalid polygon; use corrected_label"
+    quads = list(geometry.quads)
     if action == "approve_suggestion":
         orders = [x.get("semantic_to_manual") for x in failure.get("instances", [])]
     elif action == "manual_order":
@@ -172,6 +184,7 @@ def finalize(dataset: Path, v3_work: Path, work: Path, decisions_path: Path,
              output: Path) -> dict:
     cfg = Config(dataset.resolve(), v3_work.resolve(), work.resolve())
     records, v3 = image_records(cfg)
+    geometry_by_id = load_geometry(work)
     baseline = json.loads((work / "immutable_before.json").read_text(encoding="utf-8"))
     if baseline != snapshot(immutable_paths(records, v3)):
         raise RuntimeError("immutable inputs changed; finalization blocked")
@@ -196,7 +209,8 @@ def finalize(dataset: Path, v3_work: Path, work: Path, decisions_path: Path,
             pending.append({"image_id": rec.image_id, "reason": "missing decision/report"})
             continue
         image = open_rgb(rec.image_path)
-        label, error = decision_label(rec, image, decision, failure, work)
+        label, error = decision_label(
+            rec, image, geometry_by_id.get(rec.image_id), decision, failure, work)
         if error:
             pending.append({"image_id": rec.image_id, "reason": error})
         else:

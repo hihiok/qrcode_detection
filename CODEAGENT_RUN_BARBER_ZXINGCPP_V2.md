@@ -1,5 +1,8 @@
 # CodeAgent 完整执行：BarBeR 剩余 420 张审计与人工收尾
 
+> **已废弃：不要执行本文档。** V2 错误地把处理后数据集旧 TXT 当作 polygon
+> 几何来源。请改为执行 `CODEAGENT_RUN_BARBER_ZXINGCPP_V3_GEOMETRY.md`。
+
 ## 目标与完成定义
 
 继续使用已通过校准的 ZXing-C++ V2，完成剩余 420 张图片的真实审计，生成

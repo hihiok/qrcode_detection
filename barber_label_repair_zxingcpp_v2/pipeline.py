@@ -17,13 +17,9 @@ from .detector import ZXingSafeDetector, preprocess
 from .geometry import (View, apply_homography, best_vertex_assignment, crop_view,
                        quad_geometry_issue, rotate_image_and_h,
                        semantic_to_manual, warp_view)
+from .vgg_geometry import (VGGGeometryImage, build_geometry, load_geometry)
 
 
-TRANSFORM_MISMATCH = {
-    "train/barber_0cca7400213c427a", "train/barber_0f42e807fe3d45a9",
-    "train/barber_c875a42491b7a3d0", "train/barber_d39a685e5d3fe397",
-    "test/barber_ff09ede145921bbc",
-}
 CAL_PRE = ("rgb", "gray", "unsharp", "otsu")
 AUDIT_TIERS = (
     {"crops": (.20,), "warps": ((512, .10),),
@@ -46,6 +42,7 @@ class Config:
     dataset: Path
     v3_work: Path
     work: Path
+    barber_root: Path = Path(".")
     expect_total: int = 1219
     expect_gold_images: int = 799
     expect_gold_instances: int = 915
@@ -95,7 +92,20 @@ def immutable_paths(records, v3):
             list(v3.values()))
 
 
-def doctor(cfg: Config, detector: ZXingSafeDetector):
+def _geometry_context(cfg: Config, records, v3, rebuild: bool):
+    report_path = cfg.work / "vgg_gold_cross_validation_report.json"
+    manifest_path = cfg.work / "vgg_geometry_manifest.jsonl"
+    if rebuild or not report_path.is_file() or not manifest_path.is_file():
+        return build_geometry(cfg.dataset, cfg.barber_root, cfg.work, records, v3)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not report.get("passed"):
+        raise RuntimeError("cached VGG gold cross-validation passed != true")
+    geometry_report = json.loads(
+        (cfg.work / "vgg_geometry_report.json").read_text(encoding="utf-8"))
+    return load_geometry(cfg.work), geometry_report
+
+
+def doctor(cfg: Config, detector: ZXingSafeDetector, rebuild_geometry: bool = False):
     records, v3 = image_records(cfg)
     detector.negative_control()
     baseline_path = cfg.work / "immutable_before.json"
@@ -109,13 +119,24 @@ def doctor(cfg: Config, detector: ZXingSafeDetector):
                 f"immutable inputs changed since first doctor run: {changed[:5]}")
     else:
         write_json(baseline_path, current)
+    geometry, geometry_report = _geometry_context(
+        cfg, records, v3, rebuild_geometry)
     with (cfg.work / "failed_420_manifest.jsonl").open("w", encoding="utf-8") as f:
         for r in records:
             if (r.split, r.stem) not in v3:
+                item = geometry.get(r.image_id)
                 append_jsonl(f, {"image_id": r.image_id, "image_path": str(r.image_path),
                                  "label_path": str(r.label_path),
-                                 "transform_mismatch": r.image_id in TRANSFORM_MISMATCH})
-    return records, v3
+                                 "geometry_source": "barber_vgg_manual_polygon",
+                                 "vgg_geometry_resolved": item is not None,
+                                 "valid_vgg_instances": len(item.quads) if item else 0,
+                                 "invalid_vgg_instances": (len(item.invalid_objects)
+                                                           if item else None)})
+    write_json(cfg.work / "doctor_report.json", {
+        "passed": True, "dataset_images": len(records), "V3_gold_images": len(v3),
+        "failed_images": len(records) - len(v3), "vgg_geometry": geometry_report,
+        "old_txt_geometry_used": False})
+    return records, v3, geometry
 
 
 def calibration_views(image, quad):
@@ -306,11 +327,14 @@ def physical_evidence_keys(rows, ordering):
     return keys
 
 
-def copy_review(cfg, rec, grade_name, report):
+def copy_review(cfg, rec, geometry: VGGGeometryImage | None, grade_name, report):
     root = cfg.work / ("review_grade_zb" if grade_name == "ZB" else "review_grade_zm")
     target = root / rec.split
     target.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(rec.label_path, target / f"{rec.stem}.txt")
+    if geometry is not None and geometry.quads:
+        (target / f"{rec.stem}.txt").write_text(
+            "\n".join(quad.reordered_line((0, 1, 2, 3))
+                      for quad in geometry.quads) + "\n", encoding="utf-8")
     write_json(target / f"{rec.stem}.json", report)
 
 
@@ -323,7 +347,8 @@ def reset_audit_outputs(cfg: Config) -> None:
             shutil.rmtree(path)
 
 
-def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
+def audit(cfg, detector, records, v3, geometry_by_id,
+          field_to_semantic, allow_errors):
     reset_audit_outputs(cfg)
     failed = [r for r in records if (r.split, r.stem) not in v3]
     predictions, failures, image_reports = [], [], []
@@ -332,28 +357,34 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
         for rec in failed:
             image = open_rgb(rec.image_path)
             instance_reports = []
-            force_zm = rec.image_id in TRANSFORM_MISMATCH
-            try:
-                quads = parse_label(rec.label_path, *image.size)
-                parse_error = None
-            except ValueError as exc:
-                quads = []
-                parse_error = str(exc)
+            geometry = geometry_by_id.get(rec.image_id)
+            quads = list(geometry.quads) if geometry is not None else []
+            if geometry is None:
                 instance_reports.append({
-                    "instance_id": f"{rec.image_id}#parse_error", "grade": "ZM",
+                    "instance_id": f"{rec.image_id}#vgg_geometry_unresolved", "grade": "ZM",
+                    "geometry_index": None,
                     "semantic_to_manual": None,
-                    "facts": {"reason": "invalid_label_file", "detail": parse_error},
+                    "facts": {"reason": "vgg_geometry_unresolved"},
                     "_evidence_keys": set()})
+            elif geometry.invalid_objects:
+                for invalid in geometry.invalid_objects:
+                    instance_reports.append({
+                        "instance_id": invalid["instance_id"], "grade": "ZM",
+                        "geometry_index": None,
+                        "semantic_to_manual": None,
+                        "facts": {"reason": "invalid_vgg_polygon",
+                                  "detail": invalid["error"],
+                                  "raw_vertex_count": invalid["raw_vertex_count"],
+                                  "processed_points": invalid.get("processed_points")},
+                        "_evidence_keys": set()})
             for i, quad in enumerate(quads):
-                iid = f"{rec.image_id}#{i}"
+                iid = geometry.objects[i]["instance_id"]
                 rows = []
                 issue = quad_geometry_issue(quad.points)
-                if force_zm:
-                    g, ordering, facts = "ZM", None, {"reason": "transform mismatch"}
-                elif issue is not None:
+                if issue is not None:
                     g, ordering, facts = "ZM", None, {
-                        "reason": "invalid_manual_quad", "geometry_issue": issue,
-                        "manual_points": quad.points.tolist()}
+                        "reason": "invalid_vgg_quad_after_transform",
+                        "geometry_issue": issue, "vgg_points": quad.points.tolist()}
                 else:
                     view_errors: list[dict] = []
                     for tier_no, spec in enumerate(AUDIT_TIERS, 1):
@@ -379,6 +410,7 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
                         facts["skipped_geometry_views"] = view_errors
                 instance_reports.append({
                     "instance_id": iid, "grade": g,
+                    "geometry_index": i,
                     "semantic_to_manual": list(ordering) if ordering else None,
                     "facts": facts,
                     "_evidence_keys": physical_evidence_keys(rows, ordering)})
@@ -403,6 +435,9 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
                 "ZB" if all(x["grade"] in ("ZA", "ZB") for x in instance_reports)
                 else "ZM")
             report = {"image_id": rec.image_id, "grade": image_grade,
+                      "geometry_source": "barber_vgg_manual_polygon",
+                      "source_rel": geometry.source_rel if geometry else None,
+                      "expected_instance_count": len(instance_reports),
                       "instances": instance_reports}
             image_reports.append(report)
             if image_grade == "ZA":
@@ -410,12 +445,15 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
                 recovered_output_instances += len(quads)
                 out = cfg.work / "recovered_labels" / rec.split / "labels" / f"{rec.stem}.txt"
                 out.parent.mkdir(parents=True, exist_ok=True)
+                ordered_reports = sorted(
+                    (x for x in instance_reports if x["geometry_index"] is not None),
+                    key=lambda x: x["geometry_index"])
                 lines = [q.reordered_line(tuple(x["semantic_to_manual"]))
-                         for q, x in zip(quads, instance_reports)]
+                         for q, x in zip(quads, ordered_reports)]
                 out.write_text("\n".join(lines) + "\n", encoding="utf-8")
                 predictions.append(report)
             else:
-                copy_review(cfg, rec, image_grade, report)
+                copy_review(cfg, rec, geometry, image_grade, report)
                 failures.append(report)
     for name, values in (("recovered_predictions.jsonl", predictions),
                          ("recovery_failures.jsonl", failures)):
@@ -433,11 +471,18 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
             dst = combined / rec.split / "labels" / src.name
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-    write_json(cfg.work / "transform_mismatch_report.json", [
-        {"image_id": x, "grade": "ZM",
-         "reason": "requires separate source-transform audit"}
-        for x in sorted(TRANSFORM_MISMATCH)])
-    parse_path = cfg.v3_work / "barber_parse_errors.jsonl"
+    geometry_failure_path = cfg.work / "vgg_geometry_failures.jsonl"
+    geometry_failures = []
+    if geometry_failure_path.is_file():
+        for line in geometry_failure_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                geometry_failures.append(json.loads(line))
+    write_json(cfg.work / "transform_mismatch_report.json", {
+        "count": sum("transform mismatch" in row.get("error", "")
+                     for row in geometry_failures),
+        "records": [row for row in geometry_failures
+                    if "transform mismatch" in row.get("error", "")]})
+    parse_path = cfg.work / "vgg_parse_errors.jsonl"
     parse_rows = []
     if parse_path.is_file():
         for line in parse_path.read_text(encoding="utf-8").splitlines():
@@ -445,7 +490,7 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
             except json.JSONDecodeError: parse_rows.append({"raw_parse_error_record": line})
     write_json(cfg.work / "parse_error_report.json", {
         "count": len(parse_rows), "status": "manual_review", "records": parse_rows})
-    multi = [r for r in image_reports if len(r["instances"]) > 1]
+    multi = [r for r in image_reports if r["expected_instance_count"] > 1]
     write_json(cfg.work / "multi_qr_completion_report.json", {
         "multi_qr_failed_images": len(multi),
         "fully_recovered": sum(r["grade"] == "ZA" for r in multi),
@@ -458,12 +503,22 @@ def audit(cfg, detector, records, v3, field_to_semantic, allow_errors):
               "ZM_images": sum(r["grade"] == "ZM" for r in image_reports),
               "combined_proposed_images": len(v3) + za_images,
               "combined_proposed_instances": (cfg.expect_gold_instances +
-                                                recovered_output_instances)}
+                                                recovered_output_instances),
+              "geometry_source": "barber_vgg_manual_polygon",
+              "old_txt_geometry_used": False,
+              "unresolved_geometry_images": sum(
+                  geometry_by_id.get(r.image_id) is None for r in failed),
+              "invalid_vgg_instances": sum(
+                  len(geometry_by_id[r.image_id].invalid_objects)
+                  for r in failed if r.image_id in geometry_by_id),
+              "auditable_vgg_instances": sum(
+                  len(geometry_by_id[r.image_id].quads)
+                  for r in failed if r.image_id in geometry_by_id)}
     write_json(cfg.work / "recovery_report.json", report)
     return report
 
 
-def validate(cfg, records, v3, recovery):
+def validate(cfg, records, v3, geometry_by_id, recovery):
     before = json.loads((cfg.work / "immutable_before.json").read_text(encoding="utf-8"))
     after = snapshot(immutable_paths(records, v3))
     if before != after:
@@ -479,7 +534,10 @@ def validate(cfg, records, v3, recovery):
         row = json.loads(pred)
         rec = by_id[row["image_id"]]
         image = open_rgb(rec.image_path)
-        original = parse_label(rec.label_path, *image.size)
+        geometry = geometry_by_id.get(rec.image_id)
+        if geometry is None:
+            raise RuntimeError(f"recovered image lacks VGG geometry: {rec.image_id}")
+        original = list(geometry.quads)
         recovered = parse_label(
             cfg.work / "recovered_labels" / rec.split / "labels" / f"{rec.stem}.txt",
             *image.size)
@@ -490,7 +548,37 @@ def validate(cfg, records, v3, recovery):
                 raise RuntimeError(f"non-manual vertex in output: {rec.image_id}")
     write_json(cfg.work / "validation_report.json", {
         "passed": True, "original_images_labels_v3_unchanged": True,
-        "polygon_vertex_token_equality": True, "combined_count_valid": True})
+        "polygon_vertex_token_equality": True, "combined_count_valid": True,
+        "geometry_source": "barber_vgg_manual_polygon",
+        "old_txt_geometry_used": False,
+        "vgg_gold_cross_validation_passed": True})
+
+
+def reuse_calibration(source_work: Path, destination_work: Path):
+    report = json.loads((source_work / "calibration_report.json").read_text())
+    mapping = json.loads((source_work / "calibration_mapping.json").read_text())
+    reasons = []
+    if not report.get("passed"): reasons.append("source calibration passed != true")
+    if report.get("matched_instances", 0) < 50: reasons.append("matched_instances < 50")
+    if report.get("matched_observations", 0) < 100: reasons.append("matched_observations < 100")
+    if report.get("modal_mapping_ratio", 0) < .99: reasons.append("modal_mapping_ratio < .99")
+    if report.get("rotation_consistent_instances", 0) < 50:
+        reasons.append("rotation_consistent_instances < 50")
+    order = mapping.get("field_to_semantic")
+    if not isinstance(order, list) or sorted(order) != [0, 1, 2, 3]:
+        reasons.append("field_to_semantic is not a permutation")
+    if reasons:
+        raise RuntimeError("cannot reuse calibration: " + "; ".join(reasons))
+    shutil.copy2(source_work / "calibration_report.json",
+                 destination_work / "calibration_report.json")
+    shutil.copy2(source_work / "calibration_mapping.json",
+                 destination_work / "calibration_mapping.json")
+    write_json(destination_work / "calibration_reuse_report.json", {
+        "passed": True, "source_work": str(source_work),
+        "matched_instances": report["matched_instances"],
+        "matched_observations": report["matched_observations"],
+        "modal_mapping_ratio": report["modal_mapping_ratio"],
+        "rotation_consistent_instances": report["rotation_consistent_instances"]})
 
 
 def make_parser():
@@ -499,6 +587,8 @@ def make_parser():
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--v3-work", type=Path, required=True)
     p.add_argument("--work", type=Path, required=True)
+    p.add_argument("--barber-root", type=Path, required=True)
+    p.add_argument("--reuse-calibration-work", type=Path)
     p.add_argument("--allow-count-mismatch", action="store_true")
     return p
 
@@ -506,10 +596,12 @@ def make_parser():
 def main(argv=None):
     a = make_parser().parse_args(argv)
     cfg = Config(a.dataset.resolve(), a.v3_work.resolve(), a.work.resolve(),
+                 a.barber_root.resolve(),
                  allow_count_mismatch=a.allow_count_mismatch)
     cfg.work.mkdir(parents=True, exist_ok=True)
     detector = ZXingSafeDetector()
-    records, v3 = doctor(cfg, detector)
+    records, v3, geometry = doctor(
+        cfg, detector, rebuild_geometry=a.command in ("doctor", "all"))
     if a.command == "doctor":
         print("DOCTOR PASSED")
         return 0
@@ -519,14 +611,17 @@ def main(argv=None):
             print("CALIBRATION PASSED")
             return 0
     else:
+        if (not (cfg.work / "calibration_report.json").is_file() and
+                a.reuse_calibration_work is not None):
+            reuse_calibration(a.reuse_calibration_work.resolve(), cfg.work)
         report = json.loads((cfg.work / "calibration_report.json").read_text())
         mapping_obj = json.loads((cfg.work / "calibration_mapping.json").read_text())
         if not report.get("passed"):
             raise RuntimeError("audit blocked: calibration passed != true")
         mapping = tuple(mapping_obj["field_to_semantic"])
         allow_errors = bool(mapping_obj["allow_error_results"])
-    recovery = audit(cfg, detector, records, v3, mapping, allow_errors)
-    validate(cfg, records, v3, recovery)
+    recovery = audit(cfg, detector, records, v3, geometry, mapping, allow_errors)
+    validate(cfg, records, v3, geometry, recovery)
     print(json.dumps(recovery, sort_keys=True))
     return 0
 
