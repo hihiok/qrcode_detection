@@ -236,8 +236,10 @@ CUDA_VISIBLE_DEVICES=0,1 nohup python -u train_fsd_qr.py \
 
 ## 10. 多二维码评估
 
+真实集与旧合成集分别评估，不能只汇报合并指标：
+
 ~~~bash
-for dataset_root in "$BARBER_ROOT" "$BOOFCV_ROOT" "$MENDELEY_ROOT"; do
+for dataset_root in "$BARBER_ROOT" "$BOOFCV_ROOT" "$MENDELEY_ROOT" "$SYNTH_ROOT"; do
   dataset_name=$(basename "$dataset_root")
   python eval_fsd_qr.py \
     --fsd-repo "$FSD_ROOT" \
