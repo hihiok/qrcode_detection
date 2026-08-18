@@ -80,3 +80,21 @@ bash -n run_prepare_dataset.sh run_train.sh run_infer.sh
 ~~~
 
 转换验证通过后的训练步骤见 `CODEAGENT_RUN_QR_FSD.md`。
+
+## 视频等比例 Pad 推理
+
+非 3:4 视频可先居中补边到精确 3:4，再由模型缩放到 240×320，避免直接 resize 导致
+画面变形。输出尺寸会同时保证为偶数，兼容常用 MP4 codec：
+
+~~~bash
+python infer_video.py \
+  --fsd-repo /path/to/fsd \
+  --checkpoint /path/to/qr_fsd_best.pth \
+  --input input.mp4 \
+  --padded-input-output input_padded_3x4.mp4 \
+  --output detection_padded_3x4.mp4 \
+  --pad-to-portrait-3x4 --pad-value 127
+~~~
+
+逐帧 JSONL 会记录源尺寸、padded 尺寸、四边 padding 和检测结果。服务器上两个
+`from_chenshuo` 视频的完整流程见 `CODEAGENT_INFER_FROM_CHENSHUO_PADDED.md`。
