@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Single-QR dataset with semantic ordered-corner targets."""
+"""Multi-QR dataset with strict canonical targets and YUV input."""
 from __future__ import print_function
 
-import json
 import os
 
 import cv2
@@ -10,40 +9,44 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, encode_ordered_corners,
-                       match_single_qr, validate_semantic_corners)
+from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, match_qr_instances,
+                       validate_semantic_corners)
+from qr_schema import read_jsonl, validate_canonical_row
 
 
-def read_jsonl(path):
-    rows = []
-    with open(path, "r") as handle:
-        for line_number, line in enumerate(handle, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception as exc:
-                raise ValueError("%s:%d: %s" % (path, line_number, exc))
-    return rows
+def instances_from_row(row, name="annotation"):
+    """Read only qr_ordered_corners_v1; legacy rows must be converted first."""
+    _, _, _, instances = validate_canonical_row(row, name)
+    values = [validate_semantic_corners(
+        instance["corners"], "%s instance %d" % (name, index))
+              for index, instance in enumerate(instances)]
+    if not values:
+        return np.empty((0, 4, 2), dtype=np.float32)
+    return np.stack(values).astype(np.float32)
 
 
 def transform_points_homography(points, matrix):
+    shape = np.asarray(points).shape
     pts = np.asarray(points, dtype=np.float32).reshape(1, -1, 2)
-    return cv2.perspectiveTransform(pts, matrix).reshape(-1, 2)
+    return cv2.perspectiveTransform(pts, matrix).reshape(shape)
+
+
+def bgr_to_yuv_tensor(image):
+    """OpenCV BGR -> YUV444, CHW float32 in [0,1]."""
+    converted = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+    tensor = torch.from_numpy(np.ascontiguousarray(converted.transpose(2, 0, 1)))
+    return tensor.float().div_(255.0)
 
 
 class QRImageTransform(object):
-    def __init__(self, training, input_mode="y", seed=1234):
+    def __init__(self, training, seed=1234):
         self.training = bool(training)
-        self.input_mode = input_mode.lower()
         self.rng = np.random.RandomState(seed)
-        if self.input_mode not in ("y", "rgb", "yuv444"):
-            raise ValueError("input_mode must be y, rgb, or yuv444")
 
     def _geometry(self, image, corners):
-        # Do not horizontally flip. A mirror changes the QR handedness and makes
-        # semantic P0->P3 counter-clockwise. Homography preserves point identity.
+        # No horizontal mirror: it reverses semantic QR handedness.
+        if corners.shape[0] == 0:
+            return image, corners
         h, w = image.shape[:2]
         if self.rng.rand() < 0.40:
             margin = 0.025
@@ -55,13 +58,15 @@ class QRImageTransform(object):
             destination = source + jitter
             matrix = cv2.getPerspectiveTransform(source, destination)
             candidate = transform_points_homography(corners, matrix)
-            in_frame = ((candidate[:, 0] >= 0).all() and
-                        (candidate[:, 0] < w).all() and
-                        (candidate[:, 1] >= 0).all() and
-                        (candidate[:, 1] < h).all())
+            in_frame = ((candidate[:, :, 0] >= 0).all() and
+                        (candidate[:, :, 0] < w).all() and
+                        (candidate[:, :, 1] >= 0).all() and
+                        (candidate[:, :, 1] < h).all())
             if in_frame:
                 try:
-                    candidate = validate_semantic_corners(candidate, "augmented corners")
+                    candidate = np.stack([
+                        validate_semantic_corners(quad, "augmented instance %d" % index)
+                        for index, quad in enumerate(candidate)])
                     image = cv2.warpPerspective(
                         image, matrix, (w, h), flags=cv2.INTER_LINEAR,
                         borderMode=cv2.BORDER_REFLECT_101)
@@ -79,8 +84,7 @@ class QRImageTransform(object):
         img = np.clip(img, 0, 255).astype(np.uint8)
         if self.rng.rand() < 0.25:
             kernel = int(self.rng.choice([3, 5]))
-            img = cv2.GaussianBlur(img, (kernel, kernel),
-                                   self.rng.uniform(0.2, 1.3))
+            img = cv2.GaussianBlur(img, (kernel, kernel), self.rng.uniform(0.2, 1.3))
         if self.rng.rand() < 0.20:
             quality = int(self.rng.randint(35, 90))
             ok, encoded = cv2.imencode(
@@ -93,30 +97,28 @@ class QRImageTransform(object):
         if image.shape[1] != INPUT_WIDTH or image.shape[0] != INPUT_HEIGHT:
             raise ValueError("Expected W,H=240,320; got %d,%d" %
                              (image.shape[1], image.shape[0]))
-        corners = validate_semantic_corners(corners)
+        corners = np.asarray(corners, dtype=np.float32).reshape(-1, 4, 2)
         if self.training:
             image, corners = self._geometry(image, corners)
             image = self._photometric(image)
-        if self.input_mode == "y":
-            converted = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)[:, :, 0:1]
-        elif self.input_mode == "rgb":
-            converted = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        else:
-            converted = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
-        tensor = torch.from_numpy(np.ascontiguousarray(converted.transpose(2, 0, 1)))
-        return tensor.float().div_(255.0), corners
+        return bgr_to_yuv_tensor(image), corners
 
 
-class SingleQRDataset(Dataset):
-    def __init__(self, split_root, priors, training=False, input_mode="y",
+class QRDataset(Dataset):
+    def __init__(self, split_root, priors, training=False,
                  iou_threshold=0.35, seed=1234):
         self.split_root = os.path.abspath(split_root)
         self.rows = read_jsonl(os.path.join(self.split_root, "annotations.jsonl"))
         self.priors = priors.detach().cpu()
-        self.transform = QRImageTransform(training, input_mode, seed)
+        self.transform = QRImageTransform(training, seed)
         self.iou_threshold = float(iou_threshold)
         if not self.rows:
             raise RuntimeError("No annotations in %s" % self.split_root)
+        # Fail before training starts; never reinterpret an unsupported positive
+        # annotation as an empty/background image.
+        for index, row in enumerate(self.rows, 1):
+            validate_canonical_row(
+                row, os.path.join(self.split_root, "annotations.jsonl:%d" % index))
 
     def __len__(self):
         return len(self.rows)
@@ -127,9 +129,13 @@ class SingleQRDataset(Dataset):
         image = cv2.imread(path, cv2.IMREAD_COLOR)
         if image is None:
             raise IOError("Cannot read %s" % path)
-        corners = validate_semantic_corners(row["corners"], path)
+        corners = instances_from_row(row, path)
         image_tensor, corners = self.transform(image, corners)
         corners_norm = corners / np.asarray([INPUT_WIDTH, INPUT_HEIGHT], np.float32)
-        labels = match_single_qr(corners_norm, self.priors, self.iou_threshold)
-        targets = encode_ordered_corners(corners_norm, self.priors)
+        labels, targets, _ = match_qr_instances(
+            corners_norm, self.priors, self.iou_threshold)
         return image_tensor, labels, targets
+
+
+# Compatibility alias for older imports; schema semantics are strict canonical.
+SingleQRDataset = QRDataset

@@ -1,179 +1,219 @@
-# CodeAgent：基于 FSD 训练单二维码 ordered_corners(8)
+# CodeAgent：canonical 四数据集 FSD 多二维码 YUV 重训
 
-## 1. 目标与硬约束
+## 1. 目标
 
-在服务器现有 UltraFace/RFB FSD 工程中完成带方向的单二维码检测。
+使用已经统一为 `qr_ordered_corners_v1` 的 BarBeR、BoofCV、Mendeley 和 SYNTH：
 
-1. 基线只能是 `create_Mb_Tiny_RFB_fd_3_nodilation`。
-2. 输入固定 `W×H=240×320`，Tensor 固定 `N×C×320×240`；横图顺时针旋转 90°。
-3. 每张图恰好一个二维码。
-4. 模型输出只能为 `confidence(2)+ordered_corners(8)`，不保留独立 `bbox(4)` 输出。
-5. `P0/P1/P2/P3` 是二维码自身 TL/TR/BR/BL，顺时针；禁止按图像左上重新排序。
-6. 不新增 landmark 分支、第二阶段、corner refinement 或额外 backbone。
-7. 保留 backbone、RFB、extras、classification、四层 feature 和 prior；唯一必要变化是现有单一
-   `regression_headers` 末层 `anchors×4 → anchors×8` 及 reshape `4 → 8`。
-8. bbox 仅能从角点 min/max 派生，用于 prior matching、NMS 和指标，不是训练目标或模型输出。
-9. 二维码代码放独立目录，不修改现有人脸检测训练、推理和量化文件。
+1. 输入固定 W×H=240×320，Tensor 为 N×3×320×240 YUV444。
+2. 每图支持0～N个二维码。
+3. 输出 `confidence [N,4720,2] + ordered_corners [N,4720,8]`，没有 bbox head。
+4. P0/P1/P2/P3 始终为二维码自身 TL/TR/BR/BL。
+5. 从未受污染的旧单Y八角点 checkpoint 重新迁移训练。
 
-本目录代码为 canonical implementation。不得把它改回 `bbox+landmark`，不得调用
-`create_Mb_Tiny_RFB_fd_3_landmx_nodilation`。
+旧的 `qr_fsd_multi_yuv` 曾把 BoofCV/Mendeley 的 `objects[]` 漏读为负样本，禁止作为
+resume或最终模型。本次输出使用全新目录，不能覆盖旧结果。
 
-## 2. 路径
+## 2. 代理、SSL 和代码同步
 
-```bash
-FSD_ROOT=/mnt/ssd1/z00919662/AI-face-detect/ultraface_3323_ref_param
-QR_CODE_ROOT=$FSD_ROOT/qr_detection_ordered_corners
-DATA_ROOT=/data/pub1/z00919662/dataset/qr_single_240x320
-BACKGROUND_DIR=/data/pub1/z00919662/dataset/coco_ADE_12cls
-OUTPUT_DIR=$FSD_ROOT/models/qr_fsd_240x320_corners8
-```
+执行任何 git/pip/curl 网络操作前，读取：
 
-实际 FSD 根目录必须包含 `vision/ssd/mb_tiny_RFB_fd_3.py`。如果路径不同，只修改环境变量。
+~~~bash
+test -f /mnt/ssd1/z00919662/qrcode_detection/proxy.md
+test -f /mnt/ssd1/z00919662/qrcode_detection/CODEAGENT_DISABLE_SSL.md
+sed -n '1,220p' /mnt/ssd1/z00919662/qrcode_detection/proxy.md
+sed -n '1,220p' /mnt/ssd1/z00919662/qrcode_detection/CODEAGENT_DISABLE_SSL.md
+~~~
 
-## 3. 复制与只读预检
+按服务器配置设置代理，并在 git fetch/clone 前关闭 Git SSL 校验：
 
-```bash
-cd "$QR_CODE_ROOT"
-python -V
-python -c "import torch, cv2, numpy; print(torch.__version__, cv2.__version__, numpy.__version__)"
-rg -n "def create_Mb_Tiny_RFB_fd_3_nodilation|def compute_header|view.*4" \
-  "$FSD_ROOT/vision/ssd/mb_tiny_RFB_fd_3.py" \
-  "$FSD_ROOT/vision/ssd/ssd.py"
-python tests/test_qr_geometry.py
-python tests/test_qr_model_adapter.py
-```
+~~~bash
+export http_proxy="http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
+export https_proxy="http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+git config --global http.proxy "http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
+git config --global https.proxy "http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
+git config --global http.sslVerify false
+~~~
 
-确认原 factory 返回两个输出，原始回归为 `[N,4420,4]`。不要修改 FSD 源文件；`qr_model.py`
-在构建二维码模型时对实例做最小适配。
+不得在日志或报告中回显代理账号或密码。
 
-## 4. 依赖
+使用现有独立 worktree：
 
-沿用现有 FSD conda 环境，不升级 torch、torchvision、opencv 或 numpy：
+~~~bash
+export PROJECT_ROOT=/mnt/ssd1/z00919662/qrcode_detection_multi_qr_yuv
+cd "$PROJECT_ROOT"
+git status --short
+~~~
 
-```bash
-python -c "import qrcode" || python -m pip install qrcode==7.3.1 'Pillow>=8.0,<10.0'
-```
+若输出非空，立即停止；不得 stash、clean、reset 或覆盖。工作区干净时：
 
-## 5. 数据冒烟测试
+~~~bash
+git fetch origin agent/multi-qr-yuv
+git checkout --detach origin/agent/multi-qr-yuv
+git rev-parse HEAD
+git status --short
+~~~
 
-```bash
-SMOKE_ROOT=/data/pub1/z00919662/dataset/qr_single_240x320_smoke
-python prepare_qr_dataset.py synthetic \
-  --output "$SMOKE_ROOT" --background-dir "$BACKGROUND_DIR" \
-  --rotate-landscape-cw --train-count 40 --val-count 8 --test-count 8
-python validate_qr_dataset.py --data-root "$SMOKE_ROOT" --visualize 8
-```
+## 3. canonical 数据前置条件
 
-人工检查 `validation_preview`：P0 红、P1 黄、P2 蓝、P3 紫。旋转二维码中 P0 不一定是图像左上点。
+本次训练前必须已严格完成 `CODEAGENT_CANONICALIZE_QR_DATASETS.md`，并由人工确认预览。
 
-### 真实数据标注
+~~~bash
+export SOURCE_BASE=/mnt/ssd1/z00919662/qrcode_detection/dataset
+export CANONICAL_ROOT=$SOURCE_BASE/qr_canonical_v1
+export BARBER_ROOT=$CANONICAL_ROOT/barber
+export BOOFCV_ROOT=$CANONICAL_ROOT/boofcv
+export MENDELEY_ROOT=$CANONICAL_ROOT/mendeley
+export SYNTH_ROOT=$CANONICAL_ROOT/synth
+test -f "$CANONICAL_ROOT/conversion_report.json"
+~~~
 
-LabelMe 中每张图只画一个 label 为 `qrcode`/`qr`/`qr_code` 的四点 polygon。必须依次点击：
+禁止把四个旧源目录直接传给训练脚本。每个 canonical 根目录必须包含三个 split、
+`annotations.jsonl` 和图片软链接。所有行必须含：
 
-```text
-P0 QR自身左上 → P1 QR自身右上 → P2 QR自身右下 → P3 QR自身左下
-```
+~~~text
+schema_version=qr_ordered_corners_v1
+num_qrcodes=len(instances)
+instances[].class_id=0
+instances[].label=qrcode
+instances[].corner_order=TL/TR/BR/BL
+~~~
 
-转换不会自动重排，因为自动选“图像左上点”会破坏方向：
+BoofCV和Mendeley任一split若仍为0 instances，立即停止。合成集必须为4000/400/400张。
 
-```bash
-python prepare_qr_dataset.py labelme \
-  --input /absolute/path/to/labelme_real_qr \
-  --output /data/pub1/z00919662/dataset/qr_real_240x320 \
-  --rotate-cw landscape
-python validate_qr_dataset.py \
-  --data-root /data/pub1/z00919662/dataset/qr_real_240x320 --visualize 32
-```
+## 4. 环境与测试
 
-来自视频的数据必须按视频/片段分组划分，禁止相邻帧跨 train/val/test。
+~~~bash
+export PYTHON=/mnt/ssd1/z00919662/anaconda3/envs/ultraface/bin/python
+export FSD_ROOT=/mnt/ssd1/z00919662/AI-face-detect/ultraface_3323_ref_param
+export OLD_QR_CHECKPOINT=$FSD_ROOT/models/qr_fsd_240x320_corners8/qr_fsd_best.pth
+export OUTPUT_DIR=$FSD_ROOT/models/qr_fsd_multi_yuv_canonical_v1
+cd "$PROJECT_ROOT"
 
-## 6. 正式合成数据
+test -f "$FSD_ROOT/vision/ssd/mb_tiny_RFB_fd_3.py"
+test -f "$OLD_QR_CHECKPOINT"
+if [ -e "$OUTPUT_DIR" ]; then
+  echo "STOP: output already exists: $OUTPUT_DIR"
+  exit 2
+fi
 
-```bash
-DATA_ROOT="$DATA_ROOT" BACKGROUND_DIR="$BACKGROUND_DIR" \
-TRAIN_COUNT=40000 VAL_COUNT=4000 TEST_COUNT=4000 \
-bash run_prepare_dataset.sh
-```
+"$PYTHON" -V
+"$PYTHON" -c "import torch, cv2, numpy; print(torch.__version__, cv2.__version__, numpy.__version__)"
+"$PYTHON" -m py_compile *.py tests/*.py
+bash -n run_prepare_dataset.sh run_train.sh run_infer.sh
+"$PYTHON" tests/test_qr_schema.py
+"$PYTHON" tests/test_canonicalize_qr_datasets.py
+"$PYTHON" tests/test_qr_geometry.py
+"$PYTHON" tests/test_qr_model_adapter.py
+"$PYTHON" tests/test_qr_dataset.py
+"$PYTHON" tests/test_qr_loss.py
+~~~
 
-合成数据用于初始化，最终必须用 2,000–5,000 张业务真实图微调，并用独立真实 test 汇报结果。
+必须确认输入 `[1,3,320,240]`、4720 priors、confidence `[1,4720,2]`、
+ordered corners `[1,4720,8]`、bbox output NONE。
 
-## 7. checkpoint 与模型自检
+## 5. 逐数据集验证
 
-初始化 checkpoint 应来自当前单 Y 通道、`input_size=240` 的
-`create_Mb_Tiny_RFB_fd_3_nodilation`。不使用 landmark、336 或 640×384 checkpoint。
+~~~bash
+for dataset_root in "$BARBER_ROOT" "$BOOFCV_ROOT" "$MENDELEY_ROOT" "$SYNTH_ROOT"; do
+  "$PYTHON" validate_qr_dataset.py --data-root "$dataset_root" --visualize 0
+done
+~~~
 
-`load_fd_pretrained` 的规则：
+读取四份 `validation_report.json` 和总 `conversion_report.json`，报告各split图片数、实例数、
+负样本数、实例直方图、JSON-TXT检查数、group_key检查和重复检查。检查源annotations哈希未变化。
 
-- backbone/RFB/extras/classification 必须 key 和 shape 完全匹配；
-- 原 `regression_headers` 因 `4→8` 明确跳过并重新初始化；
-- 任何其他 missing/unexpected/shape mismatch 立即停止。
+## 6. canonical 冒烟数据与一轮训练
 
-## 8. 一轮训练冒烟测试
+~~~bash
+export SMOKE_ROOT=/mnt/ssd1/z00919662/qrcode_detection/dataset_smoke_multi_canonical_v1
+if [ -e "$SMOKE_ROOT" ]; then
+  echo "STOP: smoke output already exists: $SMOKE_ROOT"
+  exit 2
+fi
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python -u train_fsd_qr.py \
-  --fsd-repo "$FSD_ROOT" --data-root "$SMOKE_ROOT" \
+"$PYTHON" prepare_qr_dataset.py synthetic \
+  --output "$SMOKE_ROOT" \
+  --background-dir /data/pub1/z00919662/dataset/coco_ADE_12cls \
+  --train-count 40 --val-count 8 --test-count 8 \
+  --max-qrs-per-image 5 --negative-ratio 0.15 \
+  --rotate-landscape-cw
+"$PYTHON" validate_qr_dataset.py --data-root "$SMOKE_ROOT" --visualize 16
+
+mkdir -p "$OUTPUT_DIR/smoke"
+CUDA_VISIBLE_DEVICES=0 "$PYTHON" -u train_fsd_qr.py \
+  --fsd-repo "$FSD_ROOT" \
+  --data-root "$SMOKE_ROOT" \
   --checkpoint-dir "$OUTPUT_DIR/smoke" \
-  --pretrained-fd /absolute/path/to/240_input_fsd_checkpoint.pth \
-  --input-mode y --input-size-key 240 \
+  --resume "$OLD_QR_CHECKPOINT" \
+  --input-mode yuv --input-size-key 240 \
   --batch-size 4 --num-workers 0 --epochs 1 --gpus 0
-```
+~~~
 
-必须看到：
+确认多GT匹配、显式负样本classification loss和反向传播正常。失败时不得开始正式训练。
 
-```text
-factory=create_Mb_Tiny_RFB_fd_3_nodilation
-NCHW=(1,1,320,240)
-priors=4420
-confidence=(1,4420,2)
-ordered_corners=(1,4420,8)
-bbox_output=NONE
-```
+## 7. 正式训练
 
-并确认 total/corner/classification loss 有限、反向传播和 checkpoint 保存成功。
-
-## 9. 正式训练
-
-```bash
-export FSD_ROOT DATA_ROOT OUTPUT_DIR
-export FD_CHECKPOINT=/absolute/path/to/240_input_fsd_checkpoint.pth
-export CUDA_VISIBLE_DEVICES=0,1
-export BATCH_SIZE=64 NUM_WORKERS=16 EPOCHS=200
+~~~bash
 mkdir -p "$OUTPUT_DIR"
-cd "$QR_CODE_ROOT"
-nohup bash run_train.sh > "$OUTPUT_DIR/nohup.out" 2>&1 &
-```
+CUDA_VISIBLE_DEVICES=0,1 nohup "$PYTHON" -u train_fsd_qr.py \
+  --fsd-repo "$FSD_ROOT" \
+  --data-root "$BARBER_ROOT" \
+  --data-root "$BOOFCV_ROOT" \
+  --data-root "$MENDELEY_ROOT" \
+  --data-root "$SYNTH_ROOT" \
+  --checkpoint-dir "$OUTPUT_DIR" \
+  --resume "$OLD_QR_CHECKPOINT" \
+  --input-mode yuv --input-size-key 240 \
+  --batch-size 64 --num-workers 16 --epochs 200 --gpus 0,1 \
+  > "$OUTPUT_DIR/nohup.out" 2>&1 &
+~~~
 
-先全网络微调。若灾难性遗忘，可用 `--freeze-base-net` 做对照，但不能改模型结构。
+首层迁移必须明确打印：旧Y权重复制到Y，U/V置零；除首层1→3外严格加载。
+使用验证loss最低的 `qr_fsd_best.pth`，不能只使用最后epoch。
 
-## 10. 测试与推理
+## 8. 分数据集评估
 
-```bash
-python eval_fsd_qr.py \
+~~~bash
+for dataset_root in "$BARBER_ROOT" "$BOOFCV_ROOT" "$MENDELEY_ROOT" "$SYNTH_ROOT"; do
+  dataset_name=$(basename "$dataset_root")
+  "$PYTHON" eval_fsd_qr.py \
+    --fsd-repo "$FSD_ROOT" \
+    --checkpoint "$OUTPUT_DIR/qr_fsd_best.pth" \
+    --data-root "$dataset_root" --split test \
+    --input-mode yuv --device cuda:0 \
+    --score-threshold 0.5 --match-iou-threshold 0.5 \
+    --max-detections 20 \
+    --output "$OUTPUT_DIR/test_metrics_${dataset_name}.json"
+done
+~~~
+
+四个数据集分别报告TP/FP/FN、precision、recall、F1、负样本误检率、bbox/polygon IoU、
+P0与ordered-corner误差、success@5px/10px。预测和GT必须一对一匹配。
+
+## 9. MP4推理
+
+先只读查找原始视频：
+
+~~~bash
+find /mnt/ssd1/z00919662/qrcode_detection -type f -iname '*vrtest*.mp4' -print
+~~~
+
+不得把已经画框的 `vrtest_output.mp4` 当输入。若找不到原始MP4，跳过并明确要求人工提供路径。
+
+找到原始视频后：
+
+~~~bash
+"$PYTHON" infer_video.py \
   --fsd-repo "$FSD_ROOT" --checkpoint "$OUTPUT_DIR/qr_fsd_best.pth" \
-  --data-root "$DATA_ROOT" --split test --input-mode y --device cuda:0 \
-  --output "$OUTPUT_DIR/test_metrics.json"
+  --input /actual/raw/vrtest.mp4 \
+  --output /mnt/ssd1/z00919662/qrcode_detection/video_output/vrtest_multi_yuv_canonical_v1.mp4 \
+  --score-threshold 0.8 --nms-threshold 0.3 --max-detections 20
+~~~
 
-INPUT_PATH=/absolute/path/to/240x320/portrait_images \
-CHECKPOINT="$OUTPUT_DIR/qr_fsd_best.pth" \
-OUTPUT_PATH="$OUTPUT_DIR/infer_preview" bash run_infer.sh
-```
+## 10. 最终报告
 
-若输入仍是 320×240 横图，直接运行 `infer_fsd_qr.py` 时添加 `--rotate-landscape-cw`。JSON 输出：
-
-```text
-score
-ordered_corners: P0,P1,P2,P3
-derived_bbox_xyxy: 仅后处理派生
-```
-
-评估角点误差时禁止 cyclic shift/minimum matching，否则会掩盖 90°/180°/270°方向错误。
-
-至少汇报 detection rate、derived bbox IoU、polygon IoU、P0 error、ordered corner error、
-success@5px/10px。合成 test 与真实业务 test 分开。
-
-## 11. CodeAgent 最终报告
-
-创建 `$OUTPUT_DIR/CODEAGENT_REPORT.md`，包含实际路径、环境/GPU、数据量、模型输出 shape、
-checkpoint 加载检查、训练命令与 best epoch、合成/真实指标、至少 50 张可视化、失败样例归因，
-以及后续 ONNX/C 侧输出由 4 改为 8、NMS bbox 从角点派生的同步修改。不要只写 `Task Complete`。
+在 `$OUTPUT_DIR/CODEAGENT_REPORT.md` 报告实际commit和路径、四数据集完整统计、schema校验、
+所有测试、YUV和checkpoint迁移、best epoch、四组测试指标、MP4路径及台球/球网等
+hard-negative结果。列出所有需要人工处理的事项，不得修改或覆盖四个源数据集。

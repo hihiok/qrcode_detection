@@ -17,7 +17,7 @@ INPUT_HEIGHT = 320
 NUM_CLASSES = 2
 CENTER_VARIANCE = 0.1
 STRIDES = (8, 16, 32, 64)
-MIN_BOXES = ((10, 16, 24), (32, 48), (64, 96), (128, 192, 256))
+MIN_BOXES = ((10, 16, 22), (28, 36, 48), (64, 96), (128, 192, 256))
 SEMANTIC_CORNER_ORDER = ("qr_top_left", "qr_top_right",
                          "qr_bottom_right", "qr_bottom_left")
 
@@ -145,22 +145,77 @@ def box_iou(boxes0, boxes1, eps=1e-9):
     return intersection / (area0[:, None] + area1[None, :] - intersection + eps)
 
 
-def match_single_qr(corners, priors, iou_threshold=0.35):
-    """Match using a derived GT bbox, but return class labels only."""
-    points = torch.as_tensor(corners, dtype=torch.float32).reshape(4, 2)
-    gt_box = torch.cat([points.min(dim=0)[0], points.max(dim=0)[0]]).reshape(1, 4)
-    labels = torch.zeros((priors.size(0),), dtype=torch.long)
-    ious = box_iou(center_to_corner(priors), gt_box).squeeze(1)
-    best = int(torch.argmax(ious).item())
-    positive = ious >= float(iou_threshold)
-    positive[best] = True
+def _unique_forced_matches(ious):
+    """Return unique prior indices, one for every GT, using greedy max IoU."""
+    num_priors, num_gt = ious.shape
+    if num_gt == 0:
+        return torch.empty((0,), dtype=torch.long)
+    forced = torch.full((num_gt,), -1, dtype=torch.long)
+    used = torch.zeros((num_priors,), dtype=torch.bool)
+    # Assign the hardest-to-place GT first (highest available IoU).  QR counts
+    # are small and priors are numerous, so this produces stable unique pairs.
+    remaining = list(range(num_gt))
+    while remaining:
+        choices = []
+        for gt_index in remaining:
+            values = ious[:, gt_index].clone()
+            values[used] = -1.0
+            score, prior_index = torch.max(values, dim=0)
+            choices.append((float(score.item()), gt_index, int(prior_index.item())))
+        _, gt_index, prior_index = max(choices, key=lambda item: item[0])
+        forced[gt_index] = prior_index
+        used[prior_index] = True
+        remaining.remove(gt_index)
+    return forced
+
+
+def match_qr_instances(corners, priors, iou_threshold=0.35):
+    """Assign every prior to at most one QR and encode its matched corners.
+
+    Args:
+        corners: [M,4,2] normalized semantic P0..P3. M may be zero.
+        priors: [A,4] center-form SSD priors.
+    Returns:
+        labels [A], encoded_targets [A,8], matched_gt [A] (-1 for background).
+    """
+    points = torch.as_tensor(corners, dtype=torch.float32).reshape(-1, 4, 2)
+    num_priors = priors.size(0)
+    labels = torch.zeros((num_priors,), dtype=torch.long)
+    targets = torch.zeros((num_priors, 8), dtype=torch.float32)
+    matched_gt = torch.full((num_priors,), -1, dtype=torch.long)
+    if points.size(0) == 0:
+        return labels, targets, matched_gt
+
+    gt_boxes = torch.cat([points.min(dim=1)[0], points.max(dim=1)[0]], dim=1)
+    ious = box_iou(center_to_corner(priors), gt_boxes)
+    best_iou, best_gt = torch.max(ious, dim=1)
+    positive = best_iou >= float(iou_threshold)
+
+    forced_priors = _unique_forced_matches(ious)
+    for gt_index, prior_index in enumerate(forced_priors.tolist()):
+        positive[prior_index] = True
+        best_gt[prior_index] = gt_index
+
     labels[positive] = 1
-    return labels
+    matched_gt[positive] = best_gt[positive]
+    matched_points = points[best_gt.clamp(min=0)]
+    targets = encode_ordered_corners(matched_points, priors)
+    targets[~positive] = 0.0
+    return labels, targets, matched_gt
 
 
 def encode_ordered_corners(corners, priors):
-    """Encode semantic P0..P3 relative to each prior center/size."""
-    points = torch.as_tensor(corners, dtype=torch.float32).reshape(1, 4, 2)
+    """Encode semantic P0..P3 relative to priors.
+
+    ``corners`` may be one [4,2] quad (broadcast to every prior) or one
+    matched [A,4,2] quad per prior.
+    """
+    points = torch.as_tensor(corners, dtype=torch.float32).reshape(-1, 4, 2)
+    if points.size(0) == 1:
+        points = points.expand(priors.size(0), 4, 2)
+    if points.size(0) != priors.size(0):
+        raise ValueError("corners/priors mismatch: %d vs %d" %
+                         (points.size(0), priors.size(0)))
     encoded = (points - priors[:, None, :2]) / \
         (CENTER_VARIANCE * priors[:, None, 2:])
     return encoded.reshape(priors.size(0), 8)
@@ -233,7 +288,16 @@ def load_fd_pretrained(model, checkpoint_path):
         if key not in current:
             unexpected.append(key)
         elif tuple(value.shape) != tuple(current[key].shape):
-            bad_shapes.append((key, tuple(value.shape), tuple(current[key].shape)))
+            if (value.dim() == 4 and current[key].dim() == 4 and
+                    value.size(1) == 1 and current[key].size(1) == 3 and
+                    value.size(0) == current[key].size(0) and
+                    tuple(value.shape[2:]) == tuple(current[key].shape[2:])):
+                adapted = torch.zeros_like(current[key])
+                adapted[:, 0:1] = value
+                usable[key] = adapted
+                print("Adapted single-Y input tensor to YUV: %s" % key)
+            else:
+                bad_shapes.append((key, tuple(value.shape), tuple(current[key].shape)))
         else:
             usable[key] = value
     if unexpected:
@@ -253,8 +317,23 @@ def load_fd_pretrained(model, checkpoint_path):
 
 
 def load_qr_checkpoint_strict(model, checkpoint_path):
-    model.load_state_dict(extract_state_dict(
-        torch.load(checkpoint_path, map_location="cpu")), strict=True)
+    loaded = extract_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+    current = model.state_dict()
+    adapted_keys = []
+    for key, value in list(loaded.items()):
+        if key not in current or tuple(value.shape) == tuple(current[key].shape):
+            continue
+        if (value.dim() == 4 and current[key].dim() == 4 and
+                value.size(1) == 1 and current[key].size(1) == 3 and
+                value.size(0) == current[key].size(0) and
+                tuple(value.shape[2:]) == tuple(current[key].shape[2:])):
+            adapted = torch.zeros_like(current[key])
+            adapted[:, 0:1] = value
+            loaded[key] = adapted
+            adapted_keys.append(key)
+    model.load_state_dict(loaded, strict=True)
+    if adapted_keys:
+        print("Adapted QR checkpoint single-Y input to YUV: %s" % adapted_keys)
 
 
 def save_json(path, value):
