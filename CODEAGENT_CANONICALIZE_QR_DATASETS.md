@@ -64,8 +64,10 @@ export CANONICAL_ROOT=$SOURCE_BASE/qr_canonical_v1
 export PYTHON=/mnt/ssd1/z00919662/anaconda3/envs/ultraface/bin/python
 cd "$PROJECT_ROOT"
 "$PYTHON" -m py_compile qr_schema.py canonicalize_qr_datasets.py \
-  qr_dataset.py validate_qr_dataset.py tests/test_qr_schema.py tests/test_qr_dataset.py
+  qr_dataset.py validate_qr_dataset.py tests/test_qr_schema.py \
+  tests/test_canonicalize_qr_datasets.py tests/test_qr_dataset.py
 "$PYTHON" tests/test_qr_schema.py
+"$PYTHON" tests/test_canonicalize_qr_datasets.py
 "$PYTHON" tests/test_qr_dataset.py
 ~~~
 
