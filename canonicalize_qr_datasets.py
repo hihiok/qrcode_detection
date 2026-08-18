@@ -14,6 +14,7 @@ from qr_schema import (CORNER_ORDER, canonical_json, canonicalize_row,
 
 
 SPLITS = ("train", "val", "test")
+SPLIT_PRIORITY = {"train": 1, "val": 2, "test": 3}
 
 
 def sha256_file(path):
@@ -87,14 +88,36 @@ def write_jsonl(path, rows):
             handle.write(canonical_json(row) + "\n")
 
 
+def label_signature(row):
+    """Return the exact semantic label payload, excluding path/source metadata."""
+    return canonical_json({
+        "width": row["width"],
+        "height": row["height"],
+        "num_qrcodes": row["num_qrcodes"],
+        "instances": row["instances"],
+    })
+
+
 def convert_dataset(name, source_root, output_root, tolerance, hash_images,
-                    global_image_hashes, global_duplicate_warnings):
+                    deduplicate_identical_images, global_image_hashes,
+                    global_duplicate_warnings):
+    if deduplicate_identical_images and not hash_images:
+        raise ValueError("deduplicate-identical-images requires image hashing")
     dataset_output = os.path.join(output_root, name)
     os.makedirs(dataset_output)
     report = {"source_root": source_root, "splits": {},
-              "corner_order": list(CORNER_ORDER), "group_leakage_checked": True}
+              "corner_order": list(CORNER_ORDER), "group_leakage_checked": True,
+              "duplicate_policy": (
+                  "identical_sha256_and_labels_keep_test_then_val_then_train"
+                  if deduplicate_identical_images else "reject_cross_split"),
+              "duplicate_resolutions": []}
     group_splits = {}
-    dataset_image_hashes = {}
+    prepared_by_split = {}
+    source_annotation_hashes = {}
+    dataset_hash_groups = collections.defaultdict(list)
+
+    # Read and validate every split before writing output. This is required to
+    # choose a deterministic keeper when a later split outranks an earlier one.
     for split in SPLITS:
         source_split = os.path.join(source_root, split)
         annotation_path = os.path.join(source_split, "annotations.jsonl")
@@ -103,6 +126,7 @@ def convert_dataset(name, source_root, output_root, tolerance, hash_images,
             raise ValueError("%s/%s is missing annotations.jsonl or images/" %
                              (name, split))
         annotation_hash_before = sha256_file(annotation_path)
+        source_annotation_hashes[split] = annotation_hash_before
         output_split = os.path.join(dataset_output, split)
         os.makedirs(output_split)
         os.symlink(os.path.abspath(image_root), os.path.join(output_split, "images"))
@@ -110,9 +134,7 @@ def convert_dataset(name, source_root, output_root, tolerance, hash_images,
         if os.path.isdir(labels_root):
             os.symlink(os.path.abspath(labels_root), os.path.join(output_split, "labels"))
         source_rows = read_jsonl(annotation_path)
-        canonical_rows = []
-        instance_histogram = collections.Counter()
-        label_files_checked = 0
+        prepared_rows = []
         seen_images = set()
         for index, source_row in enumerate(source_rows, 1):
             row_name = "%s/%s:%d" % (name, split, index)
@@ -124,8 +146,8 @@ def convert_dataset(name, source_root, output_root, tolerance, hash_images,
             image_path = safe_join(source_split, image, "%s image" % row_name)
             if not os.path.isfile(image_path):
                 raise ValueError("%s image does not exist: %s" % (row_name, image_path))
-            if verify_label_file(row, source_row, source_split, tolerance, row_name):
-                label_files_checked += 1
+            label_file_checked = verify_label_file(
+                row, source_row, source_split, tolerance, row_name)
             group_key = source_row.get("group_key")
             if group_key is not None:
                 previous = group_splits.get(str(group_key))
@@ -133,37 +155,97 @@ def convert_dataset(name, source_root, output_root, tolerance, hash_images,
                     raise ValueError("%s group_key %s crosses %s and %s" %
                                      (name, group_key, previous, split))
                 group_splits[str(group_key)] = split
-            if hash_images:
-                image_hash = sha256_file(image_path)
-                previous = dataset_image_hashes.get(image_hash)
-                if previous is not None and previous[0] != split:
-                    raise ValueError("%s exact image duplicate crosses splits: %s and %s" %
-                                     (name, previous[1], image_path))
-                dataset_image_hashes[image_hash] = (split, image_path)
+            validate_canonical_row(row, row_name)
+            image_hash = sha256_file(image_path) if hash_images else None
+            prepared = {
+                "split": split,
+                "row_name": row_name,
+                "row": row,
+                "image_path": image_path,
+                "image_hash": image_hash,
+                "label_file_checked": label_file_checked,
+                "dropped": False,
+            }
+            prepared_rows.append(prepared)
+            if image_hash is not None:
+                dataset_hash_groups[image_hash].append(prepared)
+        prepared_by_split[split] = prepared_rows
+
+    if hash_images:
+        for image_hash, items in sorted(dataset_hash_groups.items()):
+            if len(set(item["split"] for item in items)) <= 1:
+                continue
+            first = items[0]
+            if len(set(label_signature(item["row"]) for item in items)) != 1:
+                raise ValueError(
+                    "%s exact image duplicate has conflicting canonical labels: %s" %
+                    (name, ", ".join(item["image_path"] for item in items)))
+            if not deduplicate_identical_images:
+                raise ValueError("%s exact image duplicate crosses splits: %s and %s" %
+                                 (name, first["image_path"], items[1]["image_path"]))
+            ordered = sorted(
+                items,
+                key=lambda item: (-SPLIT_PRIORITY[item["split"]],
+                                  item["row"]["image"], item["row_name"]))
+            keeper = ordered[0]
+            dropped = ordered[1:]
+            for item in dropped:
+                item["dropped"] = True
+            report["duplicate_resolutions"].append({
+                "sha256": image_hash,
+                "labels_identical": True,
+                "policy": "keep test > val > train; lexical path tie-break",
+                "keeper": {
+                    "split": keeper["split"],
+                    "image": keeper["row"]["image"],
+                    "source_path": keeper["image_path"],
+                },
+                "dropped": [{
+                    "split": item["split"],
+                    "image": item["row"]["image"],
+                    "source_path": item["image_path"],
+                } for item in dropped],
+            })
+
+        for items in dataset_hash_groups.values():
+            for item in items:
+                if item["dropped"]:
+                    continue
+                image_hash = item["image_hash"]
                 global_previous = global_image_hashes.get(image_hash)
                 if global_previous is not None and global_previous[0] != name:
                     global_duplicate_warnings.append({
                         "sha256": image_hash,
                         "first": global_previous[1],
-                        "second": image_path,
+                        "second": item["image_path"],
                     })
                 else:
-                    global_image_hashes[image_hash] = (name, image_path)
-            validate_canonical_row(row, row_name)
-            canonical_rows.append(row)
-            instance_histogram[str(row["num_qrcodes"])] += 1
+                    global_image_hashes[image_hash] = (name, item["image_path"])
+
+    for split in SPLITS:
+        source_split = os.path.join(source_root, split)
+        annotation_path = os.path.join(source_split, "annotations.jsonl")
+        kept = [item for item in prepared_by_split[split] if not item["dropped"]]
+        canonical_rows = [item["row"] for item in kept]
+        instance_histogram = collections.Counter(
+            str(row["num_qrcodes"]) for row in canonical_rows)
+        output_split = os.path.join(dataset_output, split)
         output_annotations = os.path.join(output_split, "annotations.jsonl")
         write_jsonl(output_annotations, canonical_rows)
-        if sha256_file(annotation_path) != annotation_hash_before:
+        if sha256_file(annotation_path) != source_annotation_hashes[split]:
             raise RuntimeError("source annotations changed during conversion: %s" %
                                annotation_path)
         report["splits"][split] = {
             "images": len(canonical_rows),
+            "source_rows": len(prepared_by_split[split]),
+            "dropped_exact_duplicates": sum(
+                item["dropped"] for item in prepared_by_split[split]),
             "instances": sum(row["num_qrcodes"] for row in canonical_rows),
             "negative_images": sum(row["num_qrcodes"] == 0 for row in canonical_rows),
             "instances_per_image": dict(sorted(instance_histogram.items())),
-            "label_files_checked": label_files_checked,
-            "source_annotations_sha256": annotation_hash_before,
+            "label_files_checked": sum(
+                item["label_file_checked"] for item in kept),
+            "source_annotations_sha256": source_annotation_hashes[split],
             "canonical_annotations_sha256": sha256_file(output_annotations),
         }
     return report
@@ -177,7 +259,14 @@ def main():
     parser.add_argument("--label-tolerance", type=float, default=5e-4,
                         help="Normalized per-coordinate JSON/TXT tolerance")
     parser.add_argument("--skip-image-hash", action="store_true")
+    parser.add_argument(
+        "--deduplicate-identical-images", action="store_true",
+        help=("For exact cross-split image duplicates, keep test then val then "
+              "train only when canonical labels are exactly identical"))
     args = parser.parse_args()
+    if args.skip_image_hash and args.deduplicate_identical_images:
+        raise ValueError("--deduplicate-identical-images cannot be used with "
+                         "--skip-image-hash")
     datasets = args.dataset
     names = [item[0] for item in datasets]
     if len(names) != len(set(names)):
@@ -202,13 +291,15 @@ def main():
         for name, source_root in datasets:
             reports[name] = convert_dataset(
                 name, source_root, staging, args.label_tolerance,
-                not args.skip_image_hash, global_image_hashes,
+                not args.skip_image_hash, args.deduplicate_identical_images,
+                global_image_hashes,
                 global_duplicate_warnings)
         report = {
             "schema_version": "qr_ordered_corners_v1",
             "output_root": output_root,
             "source_datasets_modified": False,
             "image_hashing_enabled": not args.skip_image_hash,
+            "deduplicate_identical_images": args.deduplicate_identical_images,
             "cross_dataset_exact_duplicate_warnings": global_duplicate_warnings,
             "datasets": reports,
         }
