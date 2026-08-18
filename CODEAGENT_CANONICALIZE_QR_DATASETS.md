@@ -18,9 +18,15 @@ sed -n '1,220p' /mnt/ssd1/z00919662/qrcode_detection/proxy.md
 sed -n '1,220p' /mnt/ssd1/z00919662/qrcode_detection/CODEAGENT_DISABLE_SSL.md
 ~~~
 
-按文件设置 http_proxy/https_proxy 和 Git proxy。公司证书链导致 fetch 失败时，在 fetch 前执行：
+按服务器配置设置代理，并在 git fetch/clone 前关闭 Git SSL 校验：
 
 ~~~bash
+export http_proxy="http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
+export https_proxy="http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+git config --global http.proxy "http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
+git config --global https.proxy "http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
 git config --global http.sslVerify false
 ~~~
 
@@ -80,6 +86,8 @@ cd "$PROJECT_ROOT"
   --dataset mendeley="$MENDELEY_SOURCE" \
   --dataset synth="$SYNTH_SOURCE" \
   --deduplicate-identical-images \
+  --conflicting-duplicate-keeper \
+    barber:val:images/barber_945dae373601f3c3.jpg \
   --output-root "$CANONICAL_ROOT"
 ~~~
 
@@ -91,16 +99,22 @@ cd "$PROJECT_ROOT"
 - 对声明了 `label_file` 的数据逐坐标交叉检查 JSON 与 TXT。
 - 检查 `num_qrcodes`、角点范围、退化四边形、图片存在性、组级 split 泄漏和精确图片重复。
 - `--deduplicate-identical-images` 不是跳过检查：仅当 SHA256 完全相同且 canonical
-  标签逐字段完全相同时才允许去重；标签冲突仍立即失败。保留优先级固定为
+  标签逐字段完全相同时才自动去重。保留优先级固定为
   `test > val > train`，同一 split 内以图片路径字典序决定。
+- 标签冲突默认立即失败。`--conflicting-duplicate-keeper` 是逐个重复组的显式人工决定：
+  参数必须精确匹配重复组中的一个现有 split/图片路径；路径写错、未匹配、匹配不唯一，
+  或出现任何其他未授权的冲突重复，都必须失败。
 - 通过软链接引用源 `images/labels`，不复制或修改源文件。
 - 任一错误时删除自身临时 staging 目录并失败；绝不留下可被误用的正式输出目录。
 
-已知 BarBeR 唯一跨 split 重复是两个完全相同的负样本。预期转换报告必须显示：
+已知 BarBeR 唯一跨 split 重复具有完全相同的图片内容，但两边各有一个 QR，角点标签
+存在约 0.01～0.2 像素差异。已经明确决定保留 val 标签。预期转换报告必须显示：
 
 - 保留 val：`barber_945dae373601f3c3.jpg`
 - canonical train 排除：`barber_cae21b30f66a5651.jpg`
-- `labels_identical: true`，train 的 `dropped_exact_duplicates: 1`
+- `labels_identical: false`
+- `explicit_conflict_resolution: true`
+- train 的 `dropped_exact_duplicates: 1`
 
 这里的“排除”只影响新 canonical JSONL；源图片和源 annotations 不得删除或修改。
 
