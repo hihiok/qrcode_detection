@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Multi-QR dataset with semantic ordered-corner targets and YUV input."""
+"""Multi-QR dataset with strict canonical targets and YUV input."""
 from __future__ import print_function
 
-import json
 import os
 
 import cv2
@@ -12,44 +11,18 @@ from torch.utils.data import Dataset
 
 from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, match_qr_instances,
                        validate_semantic_corners)
-
-
-def read_jsonl(path):
-    rows = []
-    with open(path, "r") as handle:
-        for line_number, line in enumerate(handle, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception as exc:
-                raise ValueError("%s:%d: %s" % (path, line_number, exc))
-    return rows
+from qr_schema import read_jsonl, validate_canonical_row
 
 
 def instances_from_row(row, name="annotation"):
-    """Read the canonical instances[] schema and legacy corners schemas."""
-    if "instances" in row:
-        raw = row["instances"]
-        if not isinstance(raw, list):
-            raise ValueError("%s instances must be a list" % name)
-        values = [item["corners"] if isinstance(item, dict) else item for item in raw]
-    elif "corners" in row:
-        array = np.asarray(row["corners"], dtype=np.float32)
-        if array.shape == (4, 2):
-            values = [array]
-        elif array.ndim == 3 and array.shape[1:] == (4, 2):
-            values = list(array)
-        else:
-            raise ValueError("%s corners must be [4,2] or [M,4,2]" % name)
-    else:
-        values = []
-    validated = [validate_semantic_corners(value, "%s instance %d" % (name, index))
-                 for index, value in enumerate(values)]
-    if not validated:
+    """Read only qr_ordered_corners_v1; legacy rows must be converted first."""
+    _, _, _, instances = validate_canonical_row(row, name)
+    values = [validate_semantic_corners(
+        instance["corners"], "%s instance %d" % (name, index))
+              for index, instance in enumerate(instances)]
+    if not values:
         return np.empty((0, 4, 2), dtype=np.float32)
-    return np.stack(validated).astype(np.float32)
+    return np.stack(values).astype(np.float32)
 
 
 def transform_points_homography(points, matrix):
@@ -141,6 +114,11 @@ class QRDataset(Dataset):
         self.iou_threshold = float(iou_threshold)
         if not self.rows:
             raise RuntimeError("No annotations in %s" % self.split_root)
+        # Fail before training starts; never reinterpret an unsupported positive
+        # annotation as an empty/background image.
+        for index, row in enumerate(self.rows, 1):
+            validate_canonical_row(
+                row, os.path.join(self.split_root, "annotations.jsonl:%d" % index))
 
     def __len__(self):
         return len(self.rows)
@@ -159,5 +137,5 @@ class QRDataset(Dataset):
         return image_tensor, labels, targets
 
 
-# Compatibility alias for older imports; semantics are now zero-or-more QR.
+# Compatibility alias for older imports; schema semantics are strict canonical.
 SingleQRDataset = QRDataset
