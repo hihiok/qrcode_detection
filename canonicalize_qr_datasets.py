@@ -39,6 +39,23 @@ def parse_dataset(value):
     return name, path
 
 
+def parse_conflicting_duplicate_keeper(value):
+    parts = value.split(":", 2)
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            "keeper must be DATASET:SPLIT:relative/image/path")
+    dataset, split, image = parts
+    dataset = dataset.strip().lower()
+    split = split.strip().lower()
+    image = image.strip()
+    normalized = os.path.normpath(image)
+    if (not dataset or split not in SPLITS or not image or os.path.isabs(image) or
+            normalized == ".." or normalized.startswith(".." + os.sep)):
+        raise argparse.ArgumentTypeError(
+            "keeper must be DATASET:{train,val,test}:relative/image/path")
+    return dataset, split, image
+
+
 def safe_join(root, relative, name):
     candidate = os.path.abspath(os.path.join(root, relative))
     root_prefix = os.path.abspath(root) + os.sep
@@ -99,7 +116,8 @@ def label_signature(row):
 
 
 def convert_dataset(name, source_root, output_root, tolerance, hash_images,
-                    deduplicate_identical_images, global_image_hashes,
+                    deduplicate_identical_images,
+                    conflicting_duplicate_keepers, global_image_hashes,
                     global_duplicate_warnings):
     if deduplicate_identical_images and not hash_images:
         raise ValueError("deduplicate-identical-images requires image hashing")
@@ -115,6 +133,8 @@ def convert_dataset(name, source_root, output_root, tolerance, hash_images,
     prepared_by_split = {}
     source_annotation_hashes = {}
     dataset_hash_groups = collections.defaultdict(list)
+    conflicting_duplicate_keepers = set(conflicting_duplicate_keepers)
+    used_conflicting_duplicate_keepers = set()
 
     # Read and validate every split before writing output. This is required to
     # choose a deterministic keeper when a later split outranks an earlier one.
@@ -176,25 +196,47 @@ def convert_dataset(name, source_root, output_root, tolerance, hash_images,
             if len(set(item["split"] for item in items)) <= 1:
                 continue
             first = items[0]
-            if len(set(label_signature(item["row"]) for item in items)) != 1:
-                raise ValueError(
-                    "%s exact image duplicate has conflicting canonical labels: %s" %
-                    (name, ", ".join(item["image_path"] for item in items)))
+            labels_identical = (
+                len(set(label_signature(item["row"]) for item in items)) == 1)
             if not deduplicate_identical_images:
                 raise ValueError("%s exact image duplicate crosses splits: %s and %s" %
                                  (name, first["image_path"], items[1]["image_path"]))
-            ordered = sorted(
-                items,
-                key=lambda item: (-SPLIT_PRIORITY[item["split"]],
-                                  item["row"]["image"], item["row_name"]))
-            keeper = ordered[0]
+            if labels_identical:
+                ordered = sorted(
+                    items,
+                    key=lambda item: (-SPLIT_PRIORITY[item["split"]],
+                                      item["row"]["image"], item["row_name"]))
+                keeper = ordered[0]
+                policy = "keep test > val > train; lexical path tie-break"
+                explicit_conflict_resolution = False
+            else:
+                candidates = [
+                    item for item in items
+                    if (item["split"], item["row"]["image"]) in
+                    conflicting_duplicate_keepers
+                ]
+                if len(candidates) != 1:
+                    raise ValueError(
+                        "%s exact image duplicate has conflicting canonical labels; "
+                        "specify exactly one --conflicting-duplicate-keeper: %s" %
+                        (name, ", ".join(item["image_path"] for item in items)))
+                keeper = candidates[0]
+                keeper_key = (keeper["split"], keeper["row"]["image"])
+                used_conflicting_duplicate_keepers.add(keeper_key)
+                ordered = [keeper] + sorted(
+                    [item for item in items if item is not keeper],
+                    key=lambda item: (-SPLIT_PRIORITY[item["split"]],
+                                      item["row"]["image"], item["row_name"]))
+                policy = "explicit keeper for conflicting canonical labels"
+                explicit_conflict_resolution = True
             dropped = ordered[1:]
             for item in dropped:
                 item["dropped"] = True
             report["duplicate_resolutions"].append({
                 "sha256": image_hash,
-                "labels_identical": True,
-                "policy": "keep test > val > train; lexical path tie-break",
+                "labels_identical": labels_identical,
+                "explicit_conflict_resolution": explicit_conflict_resolution,
+                "policy": policy,
                 "keeper": {
                     "split": keeper["split"],
                     "image": keeper["row"]["image"],
@@ -206,6 +248,14 @@ def convert_dataset(name, source_root, output_root, tolerance, hash_images,
                     "source_path": item["image_path"],
                 } for item in dropped],
             })
+
+        unused_keepers = (conflicting_duplicate_keepers -
+                          used_conflicting_duplicate_keepers)
+        if unused_keepers:
+            raise ValueError(
+                "%s conflicting duplicate keeper did not match a conflicting "
+                "cross-split duplicate: %s" %
+                (name, sorted(unused_keepers)))
 
         for items in dataset_hash_groups.values():
             for item in items:
@@ -261,16 +311,35 @@ def main():
     parser.add_argument("--skip-image-hash", action="store_true")
     parser.add_argument(
         "--deduplicate-identical-images", action="store_true",
-        help=("For exact cross-split image duplicates, keep test then val then "
-              "train only when canonical labels are exactly identical"))
+        help=("Resolve exact cross-split image duplicates automatically only "
+              "when canonical labels are exactly identical"))
+    parser.add_argument(
+        "--conflicting-duplicate-keeper", action="append",
+        type=parse_conflicting_duplicate_keeper, default=[],
+        help=("Explicit DATASET:SPLIT:image keeper for one exact-image group "
+              "whose canonical labels conflict; repeat as needed"))
     args = parser.parse_args()
     if args.skip_image_hash and args.deduplicate_identical_images:
         raise ValueError("--deduplicate-identical-images cannot be used with "
                          "--skip-image-hash")
+    if (args.conflicting_duplicate_keeper and
+            not args.deduplicate_identical_images):
+        raise ValueError("--conflicting-duplicate-keeper requires "
+                         "--deduplicate-identical-images")
     datasets = args.dataset
     names = [item[0] for item in datasets]
     if len(names) != len(set(names)):
         raise ValueError("dataset names must be unique")
+    keepers_by_dataset = collections.defaultdict(set)
+    for dataset, split, image in args.conflicting_duplicate_keeper:
+        if dataset not in names:
+            raise ValueError("conflicting duplicate keeper names unknown dataset: %s" %
+                             dataset)
+        keeper = (split, image)
+        if keeper in keepers_by_dataset[dataset]:
+            raise ValueError("conflicting duplicate keeper repeated: %s:%s:%s" %
+                             (dataset, split, image))
+        keepers_by_dataset[dataset].add(keeper)
     output_root = os.path.abspath(args.output_root)
     if os.path.lexists(output_root):
         raise RuntimeError("Output already exists; refusing to overwrite: %s" % output_root)
@@ -292,7 +361,7 @@ def main():
             reports[name] = convert_dataset(
                 name, source_root, staging, args.label_tolerance,
                 not args.skip_image_hash, args.deduplicate_identical_images,
-                global_image_hashes,
+                keepers_by_dataset.get(name, set()), global_image_hashes,
                 global_duplicate_warnings)
         report = {
             "schema_version": "qr_ordered_corners_v1",
@@ -300,6 +369,10 @@ def main():
             "source_datasets_modified": False,
             "image_hashing_enabled": not args.skip_image_hash,
             "deduplicate_identical_images": args.deduplicate_identical_images,
+            "conflicting_duplicate_keepers": [
+                {"dataset": dataset, "split": split, "image": image}
+                for dataset, split, image in args.conflicting_duplicate_keeper
+            ],
             "cross_dataset_exact_duplicate_warnings": global_duplicate_warnings,
             "datasets": reports,
         }
