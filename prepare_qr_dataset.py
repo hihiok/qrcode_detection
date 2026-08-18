@@ -21,6 +21,7 @@ import qrcode
 from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, SEMANTIC_CORNER_ORDER,
                        corners_to_bbox, letterbox_image_points,
                        rotate_image_points_cw, validate_semantic_corners)
+from qr_schema import SCHEMA_VERSION, canonical_json, validate_canonical_row
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
@@ -44,8 +45,9 @@ def list_images(root):
 
 def write_jsonl(path, rows):
     with open(path, "w") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        for index, row in enumerate(rows, 1):
+            validate_canonical_row(row, "%s:%d" % (path, index))
+            handle.write(canonical_json(row) + "\n")
 
 
 def random_payload(rng, index):
@@ -248,16 +250,18 @@ def generate_split(root, split, count, seed, background_paths,
                            [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
             raise IOError("Failed to write %s" % name)
         rows.append({
+            "schema_version": SCHEMA_VERSION,
             "image": relative.replace(os.sep, "/"),
             "width": INPUT_WIDTH,
             "height": INPUT_HEIGHT,
+            "num_qrcodes": len(quads),
             "instances": [
-                {"label": "qrcode",
+                {"class_id": 0, "label": "qrcode",
                  "corners": [[float(x), float(y)] for x, y in quad],
                  "corner_order": list(SEMANTIC_CORNER_ORDER)}
                 for quad in quads
             ],
-            "synthetic": True,
+            "metadata": {"synthetic": True},
         })
         if (index + 1) % 1000 == 0:
             print("%s: %d/%d" % (split, index + 1, count))
@@ -359,19 +363,23 @@ def command_labelme(args):
         cv2.imwrite(os.path.join(args.output, split, relative), image,
                     [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         rows[split].append({
+            "schema_version": SCHEMA_VERSION,
             "image": relative.replace(os.sep, "/"),
             "width": INPUT_WIDTH,
             "height": INPUT_HEIGHT,
+            "num_qrcodes": len(points),
             "instances": [
-                {"label": "qrcode",
+                {"class_id": 0, "label": "qrcode",
                  "corners": [[float(x), float(y)] for x, y in quad],
                  "corner_order": list(SEMANTIC_CORNER_ORDER)}
                 for quad in points
             ],
-            "synthetic": False,
-            "source": os.path.relpath(json_path, args.input),
-            "rotated_clockwise": rotated,
-            "letterbox": letterbox,
+            "metadata": {
+                "synthetic": False,
+                "source": os.path.relpath(json_path, args.input),
+                "rotated_clockwise": rotated,
+                "letterbox": letterbox,
+            },
         })
     for split, split_rows in rows.items():
         write_jsonl(os.path.join(args.output, split, "annotations.jsonl"), split_rows)
