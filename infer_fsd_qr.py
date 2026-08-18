@@ -16,6 +16,7 @@ from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, SEMANTIC_CORNER_ORDER,
                        hard_nms, load_qr_checkpoint_strict, unpack_outputs)
 from qr_dataset import bgr_to_yuv_tensor
 from qr_model import build_ordered_corner_fsd
+from qr_refine import OpenCVQRRefiner
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
@@ -66,7 +67,9 @@ def valid_quad(points, image_width, image_height, min_area_ratio=0.0005,
 class QRDetector(object):
     def __init__(self, fsd_repo, checkpoint, device="cuda:0",
                  input_size_key=240, score_threshold=0.80,
-                 nms_threshold=0.3, candidate_size=400, max_detections=20):
+                 nms_threshold=0.3, candidate_size=400, max_detections=20,
+                 opencv_refine=False, refine_roi_expand=0.18,
+                 refine_min_iou=0.20, refine_max_shift=0.40):
         if str(device).startswith("cuda") and not torch.cuda.is_available():
             device = "cpu"
         self.device = torch.device(device)
@@ -74,6 +77,9 @@ class QRDetector(object):
         self.nms_threshold = float(nms_threshold)
         self.candidate_size = int(candidate_size)
         self.max_detections = int(max_detections)
+        self.refiner = (OpenCVQRRefiner(
+            refine_roi_expand, refine_min_iou, refine_max_shift)
+            if opencv_refine else None)
         self.priors, self.feature_shapes = generate_portrait_priors()
         self.priors = self.priors.to(self.device)
         self.model = build_ordered_corner_fsd(
@@ -125,6 +131,8 @@ class QRDetector(object):
                 "ordered_corners": [[float(x), float(y)] for x, y in corners],
                 "corner_order": list(SEMANTIC_CORNER_ORDER),
                 "derived_bbox_xyxy": [float(value) for value in derived_bbox]})
+        if self.refiner is not None:
+            detections = self.refiner.refine(image_bgr, detections)
         return detections
 
 
@@ -173,6 +181,11 @@ def main():
     parser.add_argument("--nms-threshold", type=float, default=0.3)
     parser.add_argument("--candidate-size", type=int, default=400)
     parser.add_argument("--max-detections", type=int, default=20)
+    parser.add_argument("--opencv-refine", action="store_true",
+                        help="Refine coarse network corners inside each ROI")
+    parser.add_argument("--refine-roi-expand", type=float, default=0.18)
+    parser.add_argument("--refine-min-iou", type=float, default=0.20)
+    parser.add_argument("--refine-max-shift", type=float, default=0.40)
     parser.add_argument("--rotate-landscape-cw", action="store_true")
     args = parser.parse_args()
     if not os.path.isdir(args.output):
@@ -180,7 +193,8 @@ def main():
     detector = QRDetector(
         args.fsd_repo, args.checkpoint, args.device, args.input_size_key,
         args.score_threshold, args.nms_threshold, args.candidate_size,
-        args.max_detections)
+        args.max_detections, args.opencv_refine, args.refine_roi_expand,
+        args.refine_min_iou, args.refine_max_shift)
     records = []
     for path in list_images(args.input):
         image = cv2.imread(path, cv2.IMREAD_COLOR)

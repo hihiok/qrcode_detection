@@ -10,6 +10,7 @@ import time
 import cv2
 
 from infer_fsd_qr import QRDetector, draw_results
+from strict_eval_guard import verify_final_input
 from video_padding import compute_center_padding, padded_size
 
 
@@ -44,6 +45,13 @@ def main():
     parser.add_argument("--score-threshold", type=float, default=0.80)
     parser.add_argument("--nms-threshold", type=float, default=0.30)
     parser.add_argument("--max-detections", type=int, default=20)
+    parser.add_argument("--opencv-refine", action="store_true")
+    parser.add_argument("--refine-roi-expand", type=float, default=0.18)
+    parser.add_argument("--refine-min-iou", type=float, default=0.20)
+    parser.add_argument("--refine-max-shift", type=float, default=0.40)
+    parser.add_argument(
+        "--strict-eval-manifest",
+        help="Verify that input is a frozen final-evaluation video")
     parser.add_argument("--rotate-landscape-cw", action="store_true")
     parser.add_argument(
         "--pad-to-portrait-3x4", action="store_true",
@@ -71,6 +79,9 @@ def main():
     if (args.padded_input_output and
             os.path.abspath(args.output) == os.path.abspath(args.padded_input_output)):
         raise ValueError("annotated and unannotated output paths must differ")
+    strict_eval_item = None
+    if args.strict_eval_manifest:
+        strict_eval_item = verify_final_input(args.strict_eval_manifest, args.input)
 
     capture = cv2.VideoCapture(args.input)
     if not capture.isOpened():
@@ -92,7 +103,9 @@ def main():
 
     detector = QRDetector(
         args.fsd_repo, args.checkpoint, args.device, 240,
-        args.score_threshold, args.nms_threshold, 400, args.max_detections)
+        args.score_threshold, args.nms_threshold, 400, args.max_detections,
+        args.opencv_refine, args.refine_roi_expand, args.refine_min_iou,
+        args.refine_max_shift)
     writer = create_writer(args.output, args.codec, fps, output_size)
     padded_writer = None
     if args.padded_input_output:
@@ -173,6 +186,10 @@ def main():
             "total_detections": total_detections,
             "frames_with_detections": frames_with_detections,
             "max_detections_in_frame": max_detections_in_frame,
+            "strict_final_evaluation": strict_eval_item is not None,
+            "strict_eval_video_sha256": (
+                strict_eval_item["sha256"] if strict_eval_item else None),
+            "opencv_refine": bool(args.opencv_refine),
             "source_size": [width, height],
             "output_size": list(output_size),
             "pad_to_portrait_3x4": args.pad_to_portrait_3x4,

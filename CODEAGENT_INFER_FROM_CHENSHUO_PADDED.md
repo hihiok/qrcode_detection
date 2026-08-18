@@ -19,12 +19,12 @@ test -f /mnt/ssd1/z00919662/qrcode_detection/CODEAGENT_DISABLE_SSL.md
 sed -n '1,220p' /mnt/ssd1/z00919662/qrcode_detection/proxy.md
 sed -n '1,220p' /mnt/ssd1/z00919662/qrcode_detection/CODEAGENT_DISABLE_SSL.md
 
-export http_proxy="http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
-export https_proxy="http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
+export http_proxy="<从本地proxy.md读取>"
+export https_proxy="<从本地proxy.md读取>"
 export HTTP_PROXY="$http_proxy"
 export HTTPS_PROXY="$https_proxy"
-git config --global http.proxy "http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
-git config --global https.proxy "http://z00919662:Zzhs12345%21@proxyhk.huawei.com:8080"
+git config --global http.proxy "$http_proxy"
+git config --global https.proxy "$https_proxy"
 git config --global http.sslVerify false
 ~~~
 
