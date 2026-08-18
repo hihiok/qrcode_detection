@@ -8,6 +8,17 @@
 - 不输出独立 bbox；匹配、NMS、评估所需 bbox 均由四角点派生
 - P0/P1/P2/P3 固定为二维码自身 TL/TR/BR/BL
 
+## Strict V2优化流程
+
+- `CODEAGENT_PREPARE_QR_STRICT_V2_DATASET.md`：锁定两个业务视频，构建增强合成、
+  显式负样本和hard-negative，并冻结source-balanced manifest。
+- `CODEAGENT_TRAIN_QR_STRICT_V2_OPTIMIZED.md`：审计坐标/YUV/anchor，使用不改变输出结构的
+  loss和采样优化训练，只在公共validation选择阈值，最后才一次性运行锁定视频。
+
+相关工具：`strict_eval_guard.py`、`dataset_v2_manifest.py`、
+`audit_qr_training_pipeline.py`、`mine_hard_negatives.py`、
+`select_qr_threshold.py`和`qr_refine.py`。
+
 ## 唯一数据格式
 
 训练、验证和评估只接受 `qr_ordered_corners_v1`：

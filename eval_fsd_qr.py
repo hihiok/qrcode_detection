@@ -68,11 +68,20 @@ def main():
     parser.add_argument("--match-iou-threshold", type=float, default=0.50)
     parser.add_argument("--nms-threshold", type=float, default=0.30)
     parser.add_argument("--max-detections", type=int, default=20)
+    parser.add_argument("--opencv-refine", action="store_true")
+    parser.add_argument("--refine-roi-expand", type=float, default=0.18)
+    parser.add_argument("--refine-min-iou", type=float, default=0.20)
+    parser.add_argument("--refine-max-shift", type=float, default=0.40)
     parser.add_argument("--output", default="qr_eval.json")
     args = parser.parse_args()
     detector = QRDetector(
         args.fsd_repo, args.checkpoint, args.device, 240,
         args.score_threshold, args.nms_threshold, 400, args.max_detections)
+    if args.opencv_refine:
+        from qr_refine import OpenCVQRRefiner
+        detector.refiner = OpenCVQRRefiner(
+            args.refine_roi_expand, args.refine_min_iou,
+            args.refine_max_shift)
     split_root = os.path.join(args.data_root, args.split)
     rows = read_jsonl(os.path.join(split_root, "annotations.jsonl"))
 
@@ -145,7 +154,14 @@ def main():
         "ordered_corner_success_5px_matched":
             sum(x <= 5 for x in corner_errors) / float(max(len(corner_errors), 1)),
         "ordered_corner_success_10px_matched":
-            sum(x <= 10 for x in corner_errors) / float(max(len(corner_errors), 1))}
+            sum(x <= 10 for x in corner_errors) / float(max(len(corner_errors), 1)),
+        "ordered_corner_success_2px_matched":
+            sum(x <= 2 for x in corner_errors) / float(max(len(corner_errors), 1)),
+        "ordered_corner_success_4px_matched":
+            sum(x <= 4 for x in corner_errors) / float(max(len(corner_errors), 1)),
+        "ordered_corner_success_8px_matched":
+            sum(x <= 8 for x in corner_errors) / float(max(len(corner_errors), 1)),
+        "opencv_refine": bool(args.opencv_refine)}
     with open(args.output, "w") as handle:
         json.dump({"metrics": metrics, "per_image": per_image}, handle, indent=2)
     print(json.dumps(metrics, indent=2))

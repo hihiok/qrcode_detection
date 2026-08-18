@@ -3,6 +3,7 @@
 
 Subcommands:
   synthetic  - generate 0..N rendered QR instances over varied backgrounds
+  negatives  - build explicit zero-QR splits from background images
   labelme    - convert every four-point QR polygon in each LabelMe image
 """
 from __future__ import print_function
@@ -161,8 +162,75 @@ def paste_qr(background, qr_image, quad):
     return np.clip(background * (1.0 - alpha) + warped * alpha, 0, 255).astype(np.uint8)
 
 
-def degrade(image, quads, rng):
+def add_decoy_patterns(image, rng):
+    """Add non-QR square/grid/text structures used as hard negatives."""
     out = image.copy()
+    h, w = out.shape[:2]
+    for _ in range(int(rng.randint(1, 5))):
+        mode = int(rng.randint(0, 4))
+        color = tuple(int(v) for v in rng.randint(0, 256, size=3))
+        if mode == 0:
+            side = int(rng.randint(10, 55))
+            x = int(rng.randint(0, max(1, w - side)))
+            y = int(rng.randint(0, max(1, h - side)))
+            cells = int(rng.randint(2, 7))
+            cell = max(2, side // cells)
+            for row in range(cells):
+                for column in range(cells):
+                    if (row + column + int(rng.randint(0, 2))) % 2 == 0:
+                        cv2.rectangle(out, (x + column * cell, y + row * cell),
+                                      (min(w - 1, x + (column + 1) * cell),
+                                       min(h - 1, y + (row + 1) * cell)), color, -1)
+        elif mode == 1:
+            side = int(rng.randint(12, 65))
+            x = int(rng.randint(0, max(1, w - side)))
+            y = int(rng.randint(0, max(1, h - side)))
+            for inset in range(0, max(2, side // 2), max(2, side // 7)):
+                cv2.rectangle(out, (x + inset, y + inset),
+                              (x + side - inset, y + side - inset), color, 1)
+        elif mode == 2:
+            step = int(rng.randint(6, 25))
+            for x in range(int(rng.randint(0, step)), w, step):
+                cv2.line(out, (x, 0), (x, h - 1), color, 1)
+            for y in range(int(rng.randint(0, step)), h, step):
+                cv2.line(out, (0, y), (w - 1, y), color, 1)
+        else:
+            text = "".join(str(int(v)) for v in rng.randint(0, 10, size=12))
+            cv2.putText(out, text, (int(rng.randint(0, max(1, w // 3))),
+                                    int(rng.randint(20, h))),
+                        cv2.FONT_HERSHEY_SIMPLEX, rng.uniform(0.35, 0.8),
+                        color, int(rng.choice([1, 2])))
+    return out
+
+
+def motion_blur(image, rng):
+    length = int(rng.choice([3, 5, 7, 9]))
+    kernel = np.zeros((length, length), np.float32)
+    cv2.line(kernel, (0, length // 2), (length - 1, length // 2), 1.0, 1)
+    angle = float(rng.uniform(0.0, 180.0))
+    matrix = cv2.getRotationMatrix2D((length / 2.0 - 0.5,
+                                      length / 2.0 - 0.5), angle, 1.0)
+    kernel = cv2.warpAffine(kernel, matrix, (length, length))
+    kernel /= max(float(kernel.sum()), 1e-6)
+    return cv2.filter2D(image, -1, kernel)
+
+
+def simulate_yuv420(image):
+    yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+    h, w = yuv.shape[:2]
+    for channel in (1, 2):
+        small = cv2.resize(yuv[:, :, channel],
+                           (max(1, w // 2), max(1, h // 2)),
+                           interpolation=cv2.INTER_AREA)
+        yuv[:, :, channel] = cv2.resize(small, (w, h),
+                                        interpolation=cv2.INTER_LINEAR)
+    return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+
+def degrade(image, quads, rng, allow_decoys=False):
+    out = image.copy()
+    if allow_decoys and rng.rand() < 0.65:
+        out = add_decoy_patterns(out, rng)
     # Partial occlusion is kept small so all four geometric corners remain valid.
     if quads and rng.rand() < 0.18:
         quad = quads[int(rng.randint(0, len(quads)))]
@@ -180,10 +248,34 @@ def degrade(image, quads, rng):
         kernel = int(rng.choice([3, 5]))
         out = cv2.GaussianBlur(out, (kernel, kernel), rng.uniform(0.2, 1.6))
     if rng.rand() < 0.20:
-        length = int(rng.choice([3, 5, 7]))
-        kernel = np.zeros((length, length), np.float32)
-        kernel[length // 2, :] = 1.0 / length
-        out = cv2.filter2D(out, -1, kernel)
+        out = motion_blur(out, rng)
+    if rng.rand() < 0.25:
+        factor = float(rng.uniform(0.35, 0.8))
+        small = cv2.resize(out, None, fx=factor, fy=factor,
+                           interpolation=cv2.INTER_AREA)
+        out = cv2.resize(small, (image.shape[1], image.shape[0]),
+                         interpolation=cv2.INTER_LINEAR)
+    if rng.rand() < 0.20:
+        gamma = float(rng.uniform(0.55, 1.65))
+        lookup = np.asarray([min(255, round((value / 255.0) ** gamma * 255.0))
+                             for value in range(256)], dtype=np.uint8)
+        out = cv2.LUT(out, lookup)
+    if rng.rand() < 0.18:
+        overlay = out.copy()
+        center = (int(rng.randint(0, INPUT_WIDTH)),
+                  int(rng.randint(0, INPUT_HEIGHT)))
+        axes = (int(rng.randint(20, 100)), int(rng.randint(8, 45)))
+        cv2.ellipse(overlay, center, axes, rng.uniform(0, 180), 0, 360,
+                    (255, 255, 255), -1)
+        out = cv2.addWeighted(out, 1.0, overlay, rng.uniform(0.08, 0.32), 0)
+    if rng.rand() < 0.15:
+        yy, xx = np.mgrid[0:INPUT_HEIGHT, 0:INPUT_WIDTH]
+        pattern = np.sin(xx * rng.uniform(0.25, 0.8) +
+                         yy * rng.uniform(0.10, 0.45))[:, :, None]
+        out = np.clip(out.astype(np.float32) +
+                      pattern * rng.uniform(2.0, 12.0), 0, 255).astype(np.uint8)
+    if rng.rand() < 0.35:
+        out = simulate_yuv420(out)
     alpha = rng.uniform(0.55, 1.35)
     beta = rng.uniform(-35, 28)
     out = np.clip(out.astype(np.float32) * alpha + beta, 0, 255)
@@ -221,7 +313,8 @@ def sample_nonoverlapping_quad(rng, existing, min_side, max_side, max_iou=0.10):
 
 def generate_split(root, split, count, seed, background_paths,
                    rotate_landscape_cw, min_side, max_side,
-                   max_qrs, negative_ratio):
+                   max_qrs, negative_ratio, single_qr_probability,
+                   decoy_probability):
     split_root = os.path.join(root, split)
     image_root = os.path.join(split_root, "images")
     mkdir(image_root)
@@ -229,8 +322,12 @@ def generate_split(root, split, count, seed, background_paths,
     rows = []
     for index in range(count):
         background = load_background(background_paths, rng, rotate_landscape_cw)
-        num_qrs = (0 if rng.rand() < negative_ratio else
-                   int(rng.randint(1, max_qrs + 1)))
+        if rng.rand() < negative_ratio:
+            num_qrs = 0
+        elif rng.rand() < single_qr_probability:
+            num_qrs = 1
+        else:
+            num_qrs = int(rng.randint(1, max_qrs + 1))
         quads = []
         image = background
         for qr_index in range(num_qrs):
@@ -243,7 +340,9 @@ def generate_split(root, split, count, seed, background_paths,
                 random_payload(rng, index * max_qrs + qr_index), rng)
             image = paste_qr(image, qr_image, quad)
             quads.append(quad)
-        image = degrade(image, quads, rng)
+        image = degrade(image, quads, rng,
+                        allow_decoys=(num_qrs == 0 and
+                                      rng.rand() < decoy_probability))
         name = "%s_%07d.jpg" % (split, index)
         relative = os.path.join("images", name)
         if not cv2.imwrite(os.path.join(split_root, relative), image,
@@ -261,7 +360,9 @@ def generate_split(root, split, count, seed, background_paths,
                  "corner_order": list(SEMANTIC_CORNER_ORDER)}
                 for quad in quads
             ],
-            "metadata": {"synthetic": True},
+            "metadata": {"synthetic": True,
+                         "source_kind": ("synthetic_negative" if not quads
+                                         else "synthetic_positive")},
         })
         if (index + 1) % 1000 == 0:
             print("%s: %d/%d" % (split, index + 1, count))
@@ -273,19 +374,70 @@ def command_synthetic(args):
     root = os.path.abspath(args.output)
     mkdir(root)
     backgrounds = list_images(args.background_dir)
-    print("Background images: %d" % len(backgrounds))
+    background_splits = {"train": [], "val": [], "test": []}
+    for path in backgrounds:
+        name = os.path.relpath(path, args.background_dir)
+        split = split_from_name(name, args.background_train_ratio,
+                                args.background_val_ratio)
+        background_splits[split].append(path)
+    print("Background images: total=%d train=%d val=%d test=%d" %
+          (len(backgrounds), len(background_splits["train"]),
+           len(background_splits["val"]), len(background_splits["test"])))
     generate_split(root, "train", args.train_count, args.seed,
-                   backgrounds, args.rotate_landscape_cw,
+                   background_splits["train"], args.rotate_landscape_cw,
                    args.min_qr_side, args.max_qr_side,
-                   args.max_qrs_per_image, args.negative_ratio)
+                   args.max_qrs_per_image, args.negative_ratio,
+                   args.single_qr_probability, args.decoy_probability)
     generate_split(root, "val", args.val_count, args.seed + 1000003,
-                   backgrounds, args.rotate_landscape_cw,
+                   background_splits["val"], args.rotate_landscape_cw,
                    args.min_qr_side, args.max_qr_side,
-                   args.max_qrs_per_image, args.negative_ratio)
+                   args.max_qrs_per_image, args.negative_ratio,
+                   args.single_qr_probability, args.decoy_probability)
     generate_split(root, "test", args.test_count, args.seed + 2000003,
-                   backgrounds, args.rotate_landscape_cw,
+                   background_splits["test"], args.rotate_landscape_cw,
                    args.min_qr_side, args.max_qr_side,
-                   args.max_qrs_per_image, args.negative_ratio)
+                   args.max_qrs_per_image, args.negative_ratio,
+                   args.single_qr_probability, args.decoy_probability)
+
+
+def command_negatives(args):
+    paths = list_images(args.input)
+    if args.max_count > 0:
+        paths = paths[:args.max_count]
+    if not paths:
+        raise RuntimeError("No negative candidate images found in %s" % args.input)
+    rows = {"train": [], "val": [], "test": []}
+    for split in rows:
+        mkdir(os.path.join(args.output, split, "images"))
+    rng = np.random.RandomState(args.seed)
+    for index, path in enumerate(paths):
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+        image = cover_resize(image)
+        image = degrade(image, [], rng,
+                        allow_decoys=(rng.rand() < args.decoy_probability))
+        relative_source = os.path.relpath(path, args.input)
+        split = split_from_name(relative_source, args.train_ratio, args.val_ratio)
+        name = "negative_%07d.jpg" % index
+        relative = os.path.join("images", name)
+        output_path = os.path.join(args.output, split, relative)
+        if not cv2.imwrite(output_path, image,
+                           [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+            raise IOError("Failed to write %s" % output_path)
+        rows[split].append({
+            "schema_version": SCHEMA_VERSION,
+            "image": relative.replace(os.sep, "/"),
+            "width": INPUT_WIDTH,
+            "height": INPUT_HEIGHT,
+            "num_qrcodes": 0,
+            "instances": [],
+            "metadata": {"synthetic": False, "source_kind": "negative",
+                         "source": relative_source},
+        })
+    for split, split_rows in rows.items():
+        write_jsonl(os.path.join(args.output, split, "annotations.jsonl"), split_rows)
+        print("%s: %d negatives" % (split, len(split_rows)))
 
 
 def find_labelme_image(json_path, data):
@@ -400,8 +552,22 @@ def build_parser():
     synthetic.add_argument("--max-qr-side", type=float, default=190.0)
     synthetic.add_argument("--max-qrs-per-image", type=int, default=5)
     synthetic.add_argument("--negative-ratio", type=float, default=0.15)
+    synthetic.add_argument("--single-qr-probability", type=float, default=0.90)
+    synthetic.add_argument("--decoy-probability", type=float, default=0.65)
+    synthetic.add_argument("--background-train-ratio", type=float, default=0.80)
+    synthetic.add_argument("--background-val-ratio", type=float, default=0.10)
     synthetic.add_argument("--rotate-landscape-cw", action="store_true")
     synthetic.set_defaults(function=command_synthetic)
+
+    negatives = sub.add_parser("negatives")
+    negatives.add_argument("--input", required=True)
+    negatives.add_argument("--output", required=True)
+    negatives.add_argument("--max-count", type=int, default=0)
+    negatives.add_argument("--seed", type=int, default=20260818)
+    negatives.add_argument("--train-ratio", type=float, default=0.80)
+    negatives.add_argument("--val-ratio", type=float, default=0.10)
+    negatives.add_argument("--decoy-probability", type=float, default=0.35)
+    negatives.set_defaults(function=command_negatives)
 
     labelme = sub.add_parser("labelme")
     labelme.add_argument("--input", required=True)
