@@ -21,6 +21,7 @@ from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, SEMANTIC_CORNER_ORDER,
 from qr_dataset import QRDataset
 from qr_loss import QROrderedCornerLoss
 from qr_model import build_ordered_corner_fsd
+from qr_schema import SCHEMA_VERSION
 
 
 def parse_args():
@@ -204,6 +205,7 @@ def main():
         "model_outputs": {"confidence": 2, "ordered_corners": 8},
         "bbox_model_output": False,
         "input_format": "YUV444",
+        "annotation_schema": SCHEMA_VERSION,
         "supports_zero_or_more_qr": True,
         "corner_order": list(SEMANTIC_CORNER_ORDER)})
     save_json(os.path.join(args.checkpoint_dir, "training_config.json"), metadata)
