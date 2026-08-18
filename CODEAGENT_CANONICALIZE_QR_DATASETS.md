@@ -79,6 +79,7 @@ cd "$PROJECT_ROOT"
   --dataset boofcv="$BOOFCV_SOURCE" \
   --dataset mendeley="$MENDELEY_SOURCE" \
   --dataset synth="$SYNTH_SOURCE" \
+  --deduplicate-identical-images \
   --output-root "$CANONICAL_ROOT"
 ~~~
 
@@ -89,8 +90,19 @@ cd "$PROJECT_ROOT"
   统一成 `instances[]`。
 - 对声明了 `label_file` 的数据逐坐标交叉检查 JSON 与 TXT。
 - 检查 `num_qrcodes`、角点范围、退化四边形、图片存在性、组级 split 泄漏和精确图片重复。
+- `--deduplicate-identical-images` 不是跳过检查：仅当 SHA256 完全相同且 canonical
+  标签逐字段完全相同时才允许去重；标签冲突仍立即失败。保留优先级固定为
+  `test > val > train`，同一 split 内以图片路径字典序决定。
 - 通过软链接引用源 `images/labels`，不复制或修改源文件。
 - 任一错误时删除自身临时 staging 目录并失败；绝不留下可被误用的正式输出目录。
+
+已知 BarBeR 唯一跨 split 重复是两个完全相同的负样本。预期转换报告必须显示：
+
+- 保留 val：`barber_945dae373601f3c3.jpg`
+- canonical train 排除：`barber_cae21b30f66a5651.jpg`
+- `labels_identical: true`，train 的 `dropped_exact_duplicates: 1`
+
+这里的“排除”只影响新 canonical JSONL；源图片和源 annotations 不得删除或修改。
 
 ## 7. 验证及人工预览
 
@@ -115,4 +127,5 @@ $CANONICAL_ROOT/<dataset>/validation_preview/
 
 报告实际 commit、源/输出路径、每个数据集每个 split 的图片/实例/负样本/实例直方图、
 JSON-TXT核对数量、group_key检查、精确重复检查、源 annotations SHA256 未变化、所有测试结果，
-以及需要人工检查的预览路径。本任务结束后不得自行开始训练。
+`duplicate_resolutions` 的 keeper/dropped 明细，以及需要人工检查的预览路径。
+本任务结束后不得自行开始训练。
