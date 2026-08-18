@@ -77,7 +77,7 @@ def test_conversion_is_non_destructive_and_checks_label_files():
                 handle.write(json.dumps(row) + "\n")
             source_hashes[split] = sha256_file(annotation_path)
         report = convert_dataset(
-            "sample", source, output, 5e-4, True, False, {}, [])
+            "sample", source, output, 5e-4, True, False, set(), {}, [])
         assert report["splits"]["train"]["instances"] == 1
         assert report["splits"]["train"]["label_files_checked"] == 1
         for split in ("train", "val", "test"):
@@ -104,7 +104,7 @@ def test_safe_cross_split_deduplication_prefers_val_over_train():
             for split in ("train", "val", "test"))
 
         report = convert_dataset(
-            "barber", source, output, 5e-4, True, True, {}, [])
+            "barber", source, output, 5e-4, True, True, set(), {}, [])
 
         assert report["splits"]["train"]["images"] == 0
         assert report["splits"]["train"]["dropped_exact_duplicates"] == 1
@@ -135,7 +135,7 @@ def test_cross_split_duplicate_requires_explicit_mode():
         make_duplicate_source(source)
         expect_value_error(
             lambda: convert_dataset(
-                "barber", source, output, 5e-4, True, False, {}, []),
+                "barber", source, output, 5e-4, True, False, set(), {}, []),
             "exact image duplicate crosses splits")
     finally:
         shutil.rmtree(temporary)
@@ -150,8 +150,32 @@ def test_safe_mode_rejects_conflicting_labels():
         make_duplicate_source(source, conflicting_labels=True)
         expect_value_error(
             lambda: convert_dataset(
-                "barber", source, output, 5e-4, True, True, {}, []),
+                "barber", source, output, 5e-4, True, True, set(), {}, []),
             "conflicting canonical labels")
+    finally:
+        shutil.rmtree(temporary)
+
+
+def test_explicit_keeper_resolves_one_conflicting_duplicate_group():
+    temporary = tempfile.mkdtemp(prefix="qr-canonical-explicit-keeper-test-")
+    try:
+        source = os.path.join(temporary, "source")
+        output = os.path.join(temporary, "output")
+        os.makedirs(output)
+        make_duplicate_source(source, conflicting_labels=True)
+
+        report = convert_dataset(
+            "barber", source, output, 5e-4, True, True,
+            {("val", "images/val.jpg")}, {}, [])
+
+        assert report["splits"]["train"]["images"] == 0
+        assert report["splits"]["val"]["images"] == 1
+        resolution = report["duplicate_resolutions"][0]
+        assert resolution["labels_identical"] is False
+        assert resolution["explicit_conflict_resolution"] is True
+        assert resolution["keeper"]["split"] == "val"
+        assert resolution["keeper"]["image"] == "images/val.jpg"
+        assert resolution["dropped"][0]["split"] == "train"
     finally:
         shutil.rmtree(temporary)
 
@@ -161,4 +185,5 @@ if __name__ == "__main__":
     test_safe_cross_split_deduplication_prefers_val_over_train()
     test_cross_split_duplicate_requires_explicit_mode()
     test_safe_mode_rejects_conflicting_labels()
+    test_explicit_keeper_resolves_one_conflicting_duplicate_group()
     print("PASS")
