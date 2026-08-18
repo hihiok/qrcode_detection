@@ -44,12 +44,15 @@ python canonicalize_qr_datasets.py \
   --dataset mendeley=/path/to/mendeley \
   --dataset synth=/path/to/qr_full_data \
   --deduplicate-identical-images \
+  --conflicting-duplicate-keeper \
+    barber:val:images/barber_945dae373601f3c3.jpg \
   --output-root /path/to/qr_canonical_v1
 ~~~
 
 转换不会覆盖源数据集；新目录使用软链接引用源 images/labels，并对 JSON/TXT、角点数量、
 方向字段、group split 和精确重复进行校验。显式去重模式只接受 SHA256 与 canonical 标签
-同时完全一致的跨 split 重复，并按 `test > val > train` 保留；任何标签冲突仍会失败。
+同时完全一致的跨 split 重复，并按 `test > val > train` 自动保留。标签冲突默认失败；已人工
+确认的单个冲突只能用完整 dataset/split/image keeper 路径显式授权，并写入转换报告。
 服务器完整步骤见
 `CODEAGENT_CANONICALIZE_QR_DATASETS.md`。
 
