@@ -43,11 +43,14 @@ python canonicalize_qr_datasets.py \
   --dataset boofcv=/path/to/boofcv \
   --dataset mendeley=/path/to/mendeley \
   --dataset synth=/path/to/qr_full_data \
+  --deduplicate-identical-images \
   --output-root /path/to/qr_canonical_v1
 ~~~
 
 转换不会覆盖源数据集；新目录使用软链接引用源 images/labels，并对 JSON/TXT、角点数量、
-方向字段、group split 和精确重复进行校验。服务器完整步骤见
+方向字段、group split 和精确重复进行校验。显式去重模式只接受 SHA256 与 canonical 标签
+同时完全一致的跨 split 重复，并按 `test > val > train` 保留；任何标签冲突仍会失败。
+服务器完整步骤见
 `CODEAGENT_CANONICALIZE_QR_DATASETS.md`。
 
 ## 多目标训练
