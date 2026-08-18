@@ -11,6 +11,38 @@ from canonicalize_qr_datasets import convert_dataset, sha256_file
 from qr_schema import CORNER_ORDER, read_jsonl
 
 
+def expect_value_error(callable_value, text):
+    try:
+        callable_value()
+    except ValueError as exc:
+        assert text in str(exc), str(exc)
+    else:
+        raise AssertionError("expected ValueError containing: %s" % text)
+
+
+def make_duplicate_source(root, conflicting_labels=False):
+    negative = {
+        "width": 240, "height": 320, "num_qrcodes": 0, "instances": [],
+    }
+    for split in ("train", "val", "test"):
+        split_root = os.path.join(root, split)
+        os.makedirs(os.path.join(split_root, "images"))
+        row = dict(negative)
+        row["image"] = "images/%s.jpg" % split
+        image_bytes = b"same-negative-image" if split in ("train", "val") \
+            else b"unique-test-image"
+        with open(os.path.join(split_root, row["image"]), "wb") as handle:
+            handle.write(image_bytes)
+        if split == "val" and conflicting_labels:
+            row["num_qrcodes"] = 1
+            row["instances"] = [{
+                "class_id": 0,
+                "corners": [[10, 10], [30, 10], [30, 30], [10, 30]],
+            }]
+        with open(os.path.join(split_root, "annotations.jsonl"), "w") as handle:
+            handle.write(json.dumps(row) + "\n")
+
+
 def test_conversion_is_non_destructive_and_checks_label_files():
     temporary = tempfile.mkdtemp(prefix="qr-canonical-test-")
     try:
@@ -44,7 +76,8 @@ def test_conversion_is_non_destructive_and_checks_label_files():
             with open(annotation_path, "w") as handle:
                 handle.write(json.dumps(row) + "\n")
             source_hashes[split] = sha256_file(annotation_path)
-        report = convert_dataset("sample", source, output, 5e-4, True, {}, [])
+        report = convert_dataset(
+            "sample", source, output, 5e-4, True, False, {}, [])
         assert report["splits"]["train"]["instances"] == 1
         assert report["splits"]["train"]["label_files_checked"] == 1
         for split in ("train", "val", "test"):
@@ -59,6 +92,73 @@ def test_conversion_is_non_destructive_and_checks_label_files():
         shutil.rmtree(temporary)
 
 
+def test_safe_cross_split_deduplication_prefers_val_over_train():
+    temporary = tempfile.mkdtemp(prefix="qr-canonical-dedupe-test-")
+    try:
+        source = os.path.join(temporary, "source")
+        output = os.path.join(temporary, "output")
+        os.makedirs(output)
+        make_duplicate_source(source)
+        source_hashes = dict(
+            (split, sha256_file(os.path.join(source, split, "annotations.jsonl")))
+            for split in ("train", "val", "test"))
+
+        report = convert_dataset(
+            "barber", source, output, 5e-4, True, True, {}, [])
+
+        assert report["splits"]["train"]["images"] == 0
+        assert report["splits"]["train"]["dropped_exact_duplicates"] == 1
+        assert report["splits"]["val"]["images"] == 1
+        assert report["splits"]["val"]["dropped_exact_duplicates"] == 0
+        assert len(report["duplicate_resolutions"]) == 1
+        resolution = report["duplicate_resolutions"][0]
+        assert resolution["labels_identical"] is True
+        assert resolution["keeper"]["split"] == "val"
+        assert resolution["dropped"][0]["split"] == "train"
+        assert read_jsonl(os.path.join(
+            output, "barber", "train", "annotations.jsonl")) == []
+        assert len(read_jsonl(os.path.join(
+            output, "barber", "val", "annotations.jsonl"))) == 1
+        for split in ("train", "val", "test"):
+            assert sha256_file(os.path.join(source, split, "annotations.jsonl")) == \
+                source_hashes[split]
+    finally:
+        shutil.rmtree(temporary)
+
+
+def test_cross_split_duplicate_requires_explicit_mode():
+    temporary = tempfile.mkdtemp(prefix="qr-canonical-strict-duplicate-test-")
+    try:
+        source = os.path.join(temporary, "source")
+        output = os.path.join(temporary, "output")
+        os.makedirs(output)
+        make_duplicate_source(source)
+        expect_value_error(
+            lambda: convert_dataset(
+                "barber", source, output, 5e-4, True, False, {}, []),
+            "exact image duplicate crosses splits")
+    finally:
+        shutil.rmtree(temporary)
+
+
+def test_safe_mode_rejects_conflicting_labels():
+    temporary = tempfile.mkdtemp(prefix="qr-canonical-conflict-test-")
+    try:
+        source = os.path.join(temporary, "source")
+        output = os.path.join(temporary, "output")
+        os.makedirs(output)
+        make_duplicate_source(source, conflicting_labels=True)
+        expect_value_error(
+            lambda: convert_dataset(
+                "barber", source, output, 5e-4, True, True, {}, []),
+            "conflicting canonical labels")
+    finally:
+        shutil.rmtree(temporary)
+
+
 if __name__ == "__main__":
     test_conversion_is_non_destructive_and_checks_label_files()
+    test_safe_cross_split_deduplication_prefers_val_over_train()
+    test_cross_split_duplicate_requires_explicit_mode()
+    test_safe_mode_rejects_conflicting_labels()
     print("PASS")
