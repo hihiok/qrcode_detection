@@ -12,6 +12,7 @@ from torch.utils.data import Dataset
 from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, match_qr_instances,
                        validate_semantic_corners)
 from qr_schema import read_jsonl, validate_canonical_row
+from qr_two_stage_geometry import order_quad_for_crop
 
 
 def instances_from_row(row, name="annotation"):
@@ -106,12 +107,15 @@ class QRImageTransform(object):
 
 class QRDataset(Dataset):
     def __init__(self, split_root, priors, training=False,
-                 iou_threshold=0.35, seed=1234):
+                 iou_threshold=0.35, seed=1234, target_mode="semantic"):
         self.split_root = os.path.abspath(split_root)
         self.rows = read_jsonl(os.path.join(self.split_root, "annotations.jsonl"))
         self.priors = priors.detach().cpu()
         self.transform = QRImageTransform(training, seed)
         self.iou_threshold = float(iou_threshold)
+        if target_mode not in ("semantic", "geometry"):
+            raise ValueError("target_mode must be semantic or geometry")
+        self.target_mode = target_mode
         if not self.rows:
             raise RuntimeError("No annotations in %s" % self.split_root)
         # Fail before training starts; never reinterpret an unsupported positive
@@ -130,6 +134,8 @@ class QRDataset(Dataset):
         if image is None:
             raise IOError("Cannot read %s" % path)
         corners = instances_from_row(row, path)
+        if self.target_mode == "geometry" and corners.shape[0] > 0:
+            corners = np.stack([order_quad_for_crop(quad) for quad in corners])
         image_tensor, corners = self.transform(image, corners)
         corners_norm = corners / np.asarray([INPUT_WIDTH, INPUT_HEIGHT], np.float32)
         labels, targets, _ = match_qr_instances(

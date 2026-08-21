@@ -5,6 +5,7 @@ from __future__ import print_function
 import argparse
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -16,13 +17,16 @@ from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 from dataset_v2_manifest import training_sources
-from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, SEMANTIC_CORNER_ORDER,
+from qr_common import (INPUT_HEIGHT, INPUT_WIDTH, MIN_BOXES,
+                       SEMANTIC_CORNER_ORDER, STRIDES,
                        generate_portrait_priors, load_fd_pretrained,
                        load_qr_checkpoint_strict, save_json, unpack_outputs)
 from qr_dataset import QRDataset
 from qr_loss import QROrderedCornerLoss
 from qr_model import build_ordered_corner_fsd
 from qr_schema import SCHEMA_VERSION
+from qr_stage2_dataset import (QRStage2Dataset, STAGE2_MIN_BOXES,
+                               STAGE2_SCHEMA_VERSION, STAGE2_SIZE)
 
 
 def parse_args():
@@ -42,6 +46,13 @@ def parse_args():
     parser.add_argument("--input-mode", choices=("yuv", "yuv444"), default="yuv",
                         help="Compatibility flag; training is always 3-channel YUV444")
     parser.add_argument("--input-size-key", type=int, default=240)
+    parser.add_argument("--input-width", type=int, default=INPUT_WIDTH)
+    parser.add_argument("--input-height", type=int, default=INPUT_HEIGHT)
+    parser.add_argument("--dataset-kind", choices=("canonical", "stage2_roi"),
+                        default="canonical")
+    parser.add_argument(
+        "--target-mode", choices=("semantic", "geometry"), default="semantic",
+        help="semantic=P0..P3; geometry=image TL,TR,BR,BL for stage-1 only")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=200)
@@ -147,16 +158,21 @@ def run_epoch(model, loader, criterion, device, num_priors,
     return result
 
 
-def preflight(model, priors, device):
+def preflight(model, priors, device, input_width=INPUT_WIDTH,
+              input_height=INPUT_HEIGHT):
     channels = 3
     model.eval()
-    dummy = torch.zeros(1, channels, INPUT_HEIGHT, INPUT_WIDTH, device=device)
+    dummy = torch.zeros(1, channels, input_height, input_width, device=device)
     with torch.no_grad():
         confidence, corners = unpack_outputs(model(dummy), priors.size(0))
     print("PRECHECK factory=create_Mb_Tiny_RFB_fd_3_nodilation")
     print("PRECHECK tensor NCHW=%s; W,H=%d,%d" %
-          (tuple(dummy.shape), INPUT_WIDTH, INPUT_HEIGHT))
-    print("PRECHECK feature_maps=40x30,20x15,10x8,5x4 priors=%d" % priors.size(0))
+          (tuple(dummy.shape), input_width, input_height))
+    feature_shapes = [(int(math.ceil(float(input_height) / stride)),
+                       int(math.ceil(float(input_width) / stride)))
+                      for stride in STRIDES]
+    print("PRECHECK feature_maps=%s priors=%d" %
+          (feature_shapes, priors.size(0)))
     print("PRECHECK confidence=%s ordered_corners=%s; bbox_output=NONE" %
           (tuple(confidence.shape), tuple(corners.shape)))
 
@@ -191,12 +207,23 @@ def main():
     if not args.dataset_manifest and not args.data_roots:
         raise ValueError("One --dataset-manifest or at least one --data-root is required")
     set_seed(args.seed)
+    if args.dataset_kind == "canonical":
+        if (args.input_width, args.input_height) != (INPUT_WIDTH, INPUT_HEIGHT):
+            raise ValueError("canonical dataset requires input 240x320")
+    else:
+        if (args.input_width, args.input_height) != (STAGE2_SIZE, STAGE2_SIZE):
+            raise ValueError("stage2_roi dataset requires input 112x112")
+        if args.target_mode != "semantic":
+            raise ValueError("stage2_roi target mode must be semantic")
     if not os.path.isdir(args.checkpoint_dir):
         os.makedirs(args.checkpoint_dir)
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     use_cuda = torch.cuda.is_available() and args.gpus.lower() != "cpu"
     device = torch.device("cuda:0" if use_cuda else "cpu")
-    priors, feature_shapes = generate_portrait_priors()
+    priors, feature_shapes = generate_portrait_priors(
+        args.input_width, args.input_height,
+        min_boxes=(STAGE2_MIN_BOXES
+                   if args.dataset_kind == "stage2_roi" else None))
     model = build_ordered_corner_fsd(
         args.fsd_repo, is_test=False, device=str(device),
         input_size_key=args.input_size_key)
@@ -206,7 +233,7 @@ def main():
         load_fd_pretrained(model, args.pretrained_fd)
     model.to(device)
     priors_device = priors.to(device)
-    preflight(model, priors_device, device)
+    preflight(model, priors_device, device, args.input_width, args.input_height)
     parameters = configure_trainable(model, args)
     if use_cuda and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
@@ -219,16 +246,25 @@ def main():
         data_roots = list(args.data_roots)
         source_weights = None
         source_names = [os.path.basename(os.path.abspath(root)) for root in data_roots]
-    train_sets = [
-        QRDataset(os.path.join(root, "train"), priors, True,
-                  args.iou_threshold, args.seed + index)
-        for index, root in enumerate(data_roots)
-    ]
-    val_sets = [
-        QRDataset(os.path.join(root, "val"), priors, False,
-                  args.iou_threshold, args.seed + 1000 + index)
-        for index, root in enumerate(data_roots)
-    ]
+    if args.dataset_kind == "stage2_roi":
+        train_sets = [
+            QRStage2Dataset(os.path.join(root, "train"), priors, True,
+                            args.iou_threshold, args.seed + index)
+            for index, root in enumerate(data_roots)]
+        val_sets = [
+            QRStage2Dataset(os.path.join(root, "val"), priors, False,
+                            args.iou_threshold, args.seed + 1000 + index)
+            for index, root in enumerate(data_roots)]
+    else:
+        train_sets = [
+            QRDataset(os.path.join(root, "train"), priors, True,
+                      args.iou_threshold, args.seed + index, args.target_mode)
+            for index, root in enumerate(data_roots)]
+        val_sets = [
+            QRDataset(os.path.join(root, "val"), priors, False,
+                      args.iou_threshold, args.seed + 1000 + index,
+                      args.target_mode)
+            for index, root in enumerate(data_roots)]
     train_data = train_sets[0] if len(train_sets) == 1 else ConcatDataset(train_sets)
     val_data = val_sets[0] if len(val_sets) == 1 else ConcatDataset(val_sets)
     sampler = None
@@ -260,18 +296,26 @@ def main():
     scheduler = MultiStepLR(optimizer, milestones=milestones, gamma=args.gamma)
     metadata = vars(args).copy()
     metadata.update({
-        "input_width": INPUT_WIDTH, "input_height": INPUT_HEIGHT,
+        "input_width": args.input_width, "input_height": args.input_height,
         "feature_shapes": feature_shapes, "num_priors": int(priors.size(0)),
+        "prior_min_boxes": [list(value) for value in (
+            STAGE2_MIN_BOXES if args.dataset_kind == "stage2_roi" else MIN_BOXES)],
         "factory": "create_Mb_Tiny_RFB_fd_3_nodilation",
         "model_outputs": {"confidence": 2, "ordered_corners": 8},
         "bbox_model_output": False,
         "input_format": "YUV444",
-        "annotation_schema": SCHEMA_VERSION,
+        "annotation_schema": (STAGE2_SCHEMA_VERSION
+                              if args.dataset_kind == "stage2_roi"
+                              else SCHEMA_VERSION),
         "dataset_roots_resolved": data_roots,
         "dataset_source_names": source_names,
         "dataset_source_sampling_weights": source_weights,
         "supports_zero_or_more_qr": True,
-        "corner_order": list(SEMANTIC_CORNER_ORDER)})
+        "corner_order": (list(SEMANTIC_CORNER_ORDER)
+                         if args.target_mode == "semantic"
+                         else ["image_top_left", "image_top_right",
+                               "image_bottom_right", "image_bottom_left"]),
+        "target_mode": args.target_mode})
     save_json(os.path.join(args.checkpoint_dir, "training_config.json"), metadata)
     best = float("inf")
     history_path = os.path.join(args.checkpoint_dir, "history.jsonl")

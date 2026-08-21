@@ -8,6 +8,18 @@
 - 不输出独立 bbox；匹配、NMS、评估所需 bbox 均由四角点派生
 - P0/P1/P2/P3 固定为二维码自身 TL/TR/BR/BL
 
+## 两阶段方向角点流程
+
+`agent/qr-two-stage-ordered-corners-v1`使用两个结构完全相同的
+`Mb_Tiny_RFB_fd_3_nodilation`。Stage 1使用240×320全图，只预测图片几何顺序的二维码四边形；
+Stage 2使用预生成的112×112正方形单二维码透视ROI，预测二维码自身语义`P0/P1/P2/P3`，再由
+逆单应矩阵映射回原图。输入空间尺寸不同，但卷积层、head及参数tensor shape完全一致。
+
+第二阶段数据由现有有序角点gold label自动生成，训练ROI包含margin/jitter和显式负样本。依次执行：
+
+- `CODEAGENT_PREPARE_QR_STAGE2_ORDER_DATASET.md`
+- `CODEAGENT_TRAIN_AND_INFER_QR_TWO_STAGE.md`
+
 ## Strict V2优化流程
 
 - `CODEAGENT_PREPARE_QR_STRICT_V2_DATASET.md`：锁定两个业务视频，构建增强合成、

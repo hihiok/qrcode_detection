@@ -22,29 +22,30 @@ from qr_refine import OpenCVQRRefiner
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
 
-def letterbox(image_bgr):
+def letterbox(image_bgr, input_width=INPUT_WIDTH, input_height=INPUT_HEIGHT):
     old_h, old_w = image_bgr.shape[:2]
-    scale = min(float(INPUT_WIDTH) / old_w, float(INPUT_HEIGHT) / old_h)
+    scale = min(float(input_width) / old_w, float(input_height) / old_h)
     new_w = max(1, int(round(old_w * scale)))
     new_h = max(1, int(round(old_h * scale)))
     resized = cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    left = (INPUT_WIDTH - new_w) // 2
-    top = (INPUT_HEIGHT - new_h) // 2
-    canvas = np.full((INPUT_HEIGHT, INPUT_WIDTH, 3), 127, dtype=np.uint8)
+    left = (input_width - new_w) // 2
+    top = (input_height - new_h) // 2
+    canvas = np.full((input_height, input_width, 3), 127, dtype=np.uint8)
     canvas[top:top + new_h, left:left + new_w] = resized
     return canvas, {"scale": scale, "left": left, "top": top,
                     "source_width": old_w, "source_height": old_h}
 
 
-def preprocess(image_bgr):
-    network_image, meta = letterbox(image_bgr)
+def preprocess(image_bgr, input_width=INPUT_WIDTH, input_height=INPUT_HEIGHT):
+    network_image, meta = letterbox(image_bgr, input_width, input_height)
     return bgr_to_yuv_tensor(network_image).unsqueeze(0), meta
 
 
-def restore_points(points_normalized, meta):
+def restore_points(points_normalized, meta, input_width=INPUT_WIDTH,
+                   input_height=INPUT_HEIGHT):
     points = np.asarray(points_normalized, np.float32).reshape(4, 2).copy()
-    points[:, 0] = (points[:, 0] * INPUT_WIDTH - meta["left"]) / meta["scale"]
-    points[:, 1] = (points[:, 1] * INPUT_HEIGHT - meta["top"]) / meta["scale"]
+    points[:, 0] = (points[:, 0] * input_width - meta["left"]) / meta["scale"]
+    points[:, 1] = (points[:, 1] * input_height - meta["top"]) / meta["scale"]
     points[:, 0] = np.clip(points[:, 0], 0, meta["source_width"] - 1)
     points[:, 1] = np.clip(points[:, 1], 0, meta["source_height"] - 1)
     return points
@@ -69,7 +70,9 @@ class QRDetector(object):
                  input_size_key=240, score_threshold=0.80,
                  nms_threshold=0.3, candidate_size=400, max_detections=20,
                  opencv_refine=False, refine_roi_expand=0.18,
-                 refine_min_iou=0.20, refine_max_shift=0.40):
+                 refine_min_iou=0.20, refine_max_shift=0.40,
+                 input_width=INPUT_WIDTH, input_height=INPUT_HEIGHT,
+                 min_boxes=None):
         if str(device).startswith("cuda") and not torch.cuda.is_available():
             device = "cpu"
         self.device = torch.device(device)
@@ -77,17 +80,21 @@ class QRDetector(object):
         self.nms_threshold = float(nms_threshold)
         self.candidate_size = int(candidate_size)
         self.max_detections = int(max_detections)
+        self.input_width = int(input_width)
+        self.input_height = int(input_height)
         self.refiner = (OpenCVQRRefiner(
             refine_roi_expand, refine_min_iou, refine_max_shift)
             if opencv_refine else None)
-        self.priors, self.feature_shapes = generate_portrait_priors()
+        self.priors, self.feature_shapes = generate_portrait_priors(
+            self.input_width, self.input_height, min_boxes=min_boxes)
         self.priors = self.priors.to(self.device)
         self.model = build_ordered_corner_fsd(
             fsd_repo, is_test=False, device=str(self.device),
             input_size_key=input_size_key)
         load_qr_checkpoint_strict(self.model, checkpoint)
         self.model.to(self.device).eval()
-        dummy = torch.zeros(1, 3, INPUT_HEIGHT, INPUT_WIDTH, device=self.device)
+        dummy = torch.zeros(
+            1, 3, self.input_height, self.input_width, device=self.device)
         with torch.no_grad():
             confidence, corners = unpack_outputs(
                 self.model(dummy), self.priors.size(0))
@@ -97,7 +104,8 @@ class QRDetector(object):
                tuple(corners.shape), self.max_detections, self.device))
 
     def predict(self, image_bgr):
-        tensor, meta = preprocess(image_bgr)
+        tensor, meta = preprocess(
+            image_bgr, self.input_width, self.input_height)
         tensor = tensor.to(self.device)
         with torch.no_grad():
             confidence, encoded_corners = unpack_outputs(
@@ -121,7 +129,8 @@ class QRDetector(object):
 
         detections = []
         for normalized, score in zip(selected_points, selected_scores):
-            corners = restore_points(normalized, meta)
+            corners = restore_points(
+                normalized, meta, self.input_width, self.input_height)
             if not valid_quad(corners, meta["source_width"], meta["source_height"]):
                 continue
             derived_bbox = corners_to_bbox(
