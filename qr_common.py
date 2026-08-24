@@ -112,6 +112,10 @@ def letterbox_image_points(image, points, width=INPUT_WIDTH,
 def generate_portrait_priors(width=INPUT_WIDTH, height=INPUT_HEIGHT,
                              strides=STRIDES, min_boxes=MIN_BOXES):
     """Generate priors in the H,W,anchor flatten order used by SSD heads."""
+    if strides is None:
+        strides = STRIDES
+    if min_boxes is None:
+        min_boxes = MIN_BOXES
     priors = []
     feature_shapes = []
     for stride, layer_boxes in zip(strides, min_boxes):

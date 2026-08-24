@@ -158,7 +158,16 @@ def build_ordered_corner_fsd(repo_root, num_classes=NUM_CLASSES, is_test=False,
     """Build the exact nodilation factory, then minimally change its 4-D head."""
     add_repo_to_path(repo_root)
     from vision.ssd.config.fd_config import define_img_size
-    define_img_size(input_size_key)
+    try:
+        define_img_size(input_size_key)
+    except KeyError:
+        if int(input_size_key) != 112:
+            raise
+        # The original fd_config enumerates only 4:3 presets.  The network is
+        # fully convolutional and we always request raw outputs (is_test=False),
+        # so a 112x112 Stage-2 forward does not consume fd_config.priors.
+        # Our 112x112 priors are generated explicitly in qr_common.
+        print("Using custom raw-output FSD input 112x112; skipping fd_config priors")
     from vision.ssd.mb_tiny_RFB_fd_3 import create_Mb_Tiny_RFB_fd_3_nodilation
     signature = inspect.signature(create_Mb_Tiny_RFB_fd_3_nodilation)
     kwargs = {}

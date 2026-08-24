@@ -56,6 +56,88 @@ def mean(values):
     return float(np.mean(values)) if values else 0.0
 
 
+def evaluate_detector(detector, data_root, split="test", match_iou_threshold=0.50):
+    """Evaluate any detector exposing predict(image)->ordered detections."""
+    split_root = os.path.join(data_root, split)
+    rows = read_jsonl(os.path.join(split_root, "annotations.jsonl"))
+    bbox_ious, polygon_ious, corner_errors, normalized_errors, p0_errors = (
+        [], [], [], [], [])
+    total_gt = total_predictions = true_positives = 0
+    negative_images = negative_images_with_fp = 0
+    per_image = []
+    for index, row in enumerate(rows):
+        image = cv2.imread(os.path.join(split_root, row["image"]), cv2.IMREAD_COLOR)
+        if image is None:
+            raise IOError("cannot read %s" % os.path.join(split_root, row["image"]))
+        gt_corners = instances_from_row(row, row["image"])
+        predictions = detector.predict(image)
+        matches = match_instances(gt_corners, predictions, match_iou_threshold)
+        total_gt += len(gt_corners)
+        total_predictions += len(predictions)
+        true_positives += len(matches)
+        if len(gt_corners) == 0:
+            negative_images += 1
+            negative_images_with_fp += int(bool(predictions))
+        item = {"image": row["image"], "num_gt": len(gt_corners),
+                "num_predictions": len(predictions), "num_matches": len(matches),
+                "matches": []}
+        for gt_index, pred_index, biou in matches:
+            gt = gt_corners[gt_index]
+            prediction = predictions[pred_index]
+            pred = np.asarray(prediction["ordered_corners"], np.float32).reshape(4, 2)
+            errors = np.sqrt(np.sum((gt - pred) ** 2, axis=1))
+            gt_box = corners_to_bbox(gt)
+            diagonal = math.sqrt((gt_box[2] - gt_box[0]) ** 2 +
+                                 (gt_box[3] - gt_box[1]) ** 2)
+            piou = polygon_iou(gt, pred)
+            error = float(errors.mean())
+            nme = error / max(diagonal, 1e-6)
+            bbox_ious.append(biou)
+            polygon_ious.append(piou)
+            corner_errors.append(error)
+            normalized_errors.append(nme)
+            p0_errors.append(float(errors[0]))
+            item["matches"].append({
+                "gt_index": gt_index, "prediction_index": pred_index,
+                "score": prediction["score"], "derived_bbox_iou": biou,
+                "polygon_iou": piou, "p0_error_px": float(errors[0]),
+                "mean_ordered_corner_error_px": error,
+                "normalized_ordered_corner_error": nme})
+        per_image.append(item)
+        if (index + 1) % 500 == 0:
+            print("%d/%d" % (index + 1, len(rows)))
+    false_positives = total_predictions - true_positives
+    false_negatives = total_gt - true_positives
+    precision = true_positives / float(max(total_predictions, 1))
+    recall = true_positives / float(max(total_gt, 1))
+    metrics = {
+        "num_images": len(rows), "num_gt_instances": total_gt,
+        "num_predictions": total_predictions, "true_positives": true_positives,
+        "false_positives": false_positives, "false_negatives": false_negatives,
+        "precision": precision, "recall": recall,
+        "f1": 2.0 * precision * recall / max(precision + recall, 1e-9),
+        "negative_images": negative_images,
+        "negative_image_false_positive_rate":
+            negative_images_with_fp / float(max(negative_images, 1)),
+        "mean_derived_bbox_iou_matched": mean(bbox_ious),
+        "mean_polygon_iou_matched": mean(polygon_ious),
+        "mean_p0_error_px_matched": mean(p0_errors),
+        "mean_ordered_corner_error_px_matched": mean(corner_errors),
+        "mean_normalized_ordered_corner_error_matched": mean(normalized_errors),
+        "ordered_corner_success_2px_matched":
+            sum(x <= 2 for x in corner_errors) / float(max(len(corner_errors), 1)),
+        "ordered_corner_success_4px_matched":
+            sum(x <= 4 for x in corner_errors) / float(max(len(corner_errors), 1)),
+        "ordered_corner_success_5px_matched":
+            sum(x <= 5 for x in corner_errors) / float(max(len(corner_errors), 1)),
+        "ordered_corner_success_8px_matched":
+            sum(x <= 8 for x in corner_errors) / float(max(len(corner_errors), 1)),
+        "ordered_corner_success_10px_matched":
+            sum(x <= 10 for x in corner_errors) / float(max(len(corner_errors), 1)),
+    }
+    return {"metrics": metrics, "per_image": per_image}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fsd-repo", required=True)
@@ -82,89 +164,12 @@ def main():
         detector.refiner = OpenCVQRRefiner(
             args.refine_roi_expand, args.refine_min_iou,
             args.refine_max_shift)
-    split_root = os.path.join(args.data_root, args.split)
-    rows = read_jsonl(os.path.join(split_root, "annotations.jsonl"))
-
-    bbox_ious, polygon_ious, corner_errors, normalized_errors, p0_errors = (
-        [], [], [], [], [])
-    total_gt = total_predictions = true_positives = 0
-    negative_images = negative_images_with_fp = 0
-    per_image = []
-    for index, row in enumerate(rows):
-        image = cv2.imread(os.path.join(split_root, row["image"]), cv2.IMREAD_COLOR)
-        gt_corners = instances_from_row(row, row["image"])
-        predictions = detector.predict(image)
-        matches = match_instances(
-            gt_corners, predictions, args.match_iou_threshold)
-        total_gt += len(gt_corners)
-        total_predictions += len(predictions)
-        true_positives += len(matches)
-        if len(gt_corners) == 0:
-            negative_images += 1
-            negative_images_with_fp += int(bool(predictions))
-        item = {
-            "image": row["image"], "num_gt": len(gt_corners),
-            "num_predictions": len(predictions), "num_matches": len(matches),
-            "matches": []}
-        for gt_index, pred_index, biou in matches:
-            gt = gt_corners[gt_index]
-            prediction = predictions[pred_index]
-            pred = np.asarray(prediction["ordered_corners"], np.float32).reshape(4, 2)
-            # Strict semantic identity: no cyclic corner rematching.
-            errors = np.sqrt(np.sum((gt - pred) ** 2, axis=1))
-            gt_box = corners_to_bbox(gt)
-            diagonal = math.sqrt((gt_box[2] - gt_box[0]) ** 2 +
-                                 (gt_box[3] - gt_box[1]) ** 2)
-            piou = polygon_iou(gt, pred)
-            error = float(errors.mean())
-            nme = error / max(diagonal, 1e-6)
-            bbox_ious.append(biou)
-            polygon_ious.append(piou)
-            corner_errors.append(error)
-            normalized_errors.append(nme)
-            p0_errors.append(float(errors[0]))
-            item["matches"].append({
-                "gt_index": gt_index, "prediction_index": pred_index,
-                "score": prediction["score"], "derived_bbox_iou": biou,
-                "polygon_iou": piou, "p0_error_px": float(errors[0]),
-                "mean_ordered_corner_error_px": error,
-                "normalized_ordered_corner_error": nme})
-        per_image.append(item)
-        if (index + 1) % 500 == 0:
-            print("%d/%d" % (index + 1, len(rows)))
-
-    false_positives = total_predictions - true_positives
-    false_negatives = total_gt - true_positives
-    precision = true_positives / float(max(total_predictions, 1))
-    recall = true_positives / float(max(total_gt, 1))
-    metrics = {
-        "num_images": len(rows), "num_gt_instances": total_gt,
-        "num_predictions": total_predictions, "true_positives": true_positives,
-        "false_positives": false_positives, "false_negatives": false_negatives,
-        "precision": precision, "recall": recall,
-        "f1": 2.0 * precision * recall / max(precision + recall, 1e-9),
-        "negative_images": negative_images,
-        "negative_image_false_positive_rate":
-            negative_images_with_fp / float(max(negative_images, 1)),
-        "mean_derived_bbox_iou_matched": mean(bbox_ious),
-        "mean_polygon_iou_matched": mean(polygon_ious),
-        "mean_p0_error_px_matched": mean(p0_errors),
-        "mean_ordered_corner_error_px_matched": mean(corner_errors),
-        "mean_normalized_ordered_corner_error_matched": mean(normalized_errors),
-        "ordered_corner_success_5px_matched":
-            sum(x <= 5 for x in corner_errors) / float(max(len(corner_errors), 1)),
-        "ordered_corner_success_10px_matched":
-            sum(x <= 10 for x in corner_errors) / float(max(len(corner_errors), 1)),
-        "ordered_corner_success_2px_matched":
-            sum(x <= 2 for x in corner_errors) / float(max(len(corner_errors), 1)),
-        "ordered_corner_success_4px_matched":
-            sum(x <= 4 for x in corner_errors) / float(max(len(corner_errors), 1)),
-        "ordered_corner_success_8px_matched":
-            sum(x <= 8 for x in corner_errors) / float(max(len(corner_errors), 1)),
-        "opencv_refine": bool(args.opencv_refine)}
+    result = evaluate_detector(
+        detector, args.data_root, args.split, args.match_iou_threshold)
+    result["metrics"]["opencv_refine"] = bool(args.opencv_refine)
     with open(args.output, "w") as handle:
-        json.dump({"metrics": metrics, "per_image": per_image}, handle, indent=2)
-    print(json.dumps(metrics, indent=2))
+        json.dump(result, handle, indent=2)
+    print(json.dumps(result["metrics"], indent=2))
 
 
 if __name__ == "__main__":
